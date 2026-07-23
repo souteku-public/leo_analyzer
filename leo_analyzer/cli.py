@@ -17,6 +17,27 @@ from pathlib import Path
 from .speedtest import run_speedtest
 
 
+def parse_duration(value) -> int:
+    """'300' -> 300, '90s' -> 90, '10m' -> 600, '1.5h' -> 5400."""
+    if isinstance(value, int):
+        return value
+    s = str(value).strip().lower()
+    units = {"s": 1, "m": 60, "h": 3600}
+    factor = 1
+    if s and s[-1] in units:
+        factor = units[s[-1]]
+        s = s[:-1]
+    try:
+        seconds = int(float(s) * factor)
+    except ValueError:
+        raise argparse.ArgumentTypeError(
+            f"invalid duration: {value!r} (examples: 300, 90s, 10m, 1h)"
+        )
+    if seconds < 1:
+        raise argparse.ArgumentTypeError("duration must be at least 1 second")
+    return seconds
+
+
 def build_parser():
     p = argparse.ArgumentParser(
         prog="leo_analyzer",
@@ -32,9 +53,11 @@ def build_parser():
     )
     p.add_argument(
         "--duration",
-        type=int,
-        default=60,
-        help="seconds per direction (default: 60)",
+        type=parse_duration,
+        default="300",
+        metavar="TIME",
+        help="measurement time per direction: seconds, or with a unit "
+        "like 90s / 10m / 1h (default: 300 = 5 minutes)",
     )
     p.add_argument(
         "--streams",
@@ -199,7 +222,51 @@ async def run(args):
     print(f"\nfiles written to {rundir}/")
 
 
+def _ask(prompt: str, default: str) -> str:
+    try:
+        answer = input(f"{prompt} [{default}]: ").strip()
+    except EOFError:
+        answer = ""
+    return answer or default
+
+
+def interactive_args():
+    """Japanese Q&A wizard for users who start the tool with no arguments."""
+    print("=" * 60)
+    print(" LEO回線 スループット測定ツール")
+    print("=" * 60)
+    print("そのままEnterを押すと [ ] 内の既定値が使われます。\n")
+
+    print("測定する回線を選んでください:")
+    print("  1) Starlink        (アンテナ情報も同時記録)")
+    print("  2) OneWeb Kymeta   (アンテナ情報も同時記録)")
+    print("  3) OneWeb Intellian / その他 (速度測定のみ)")
+    choice = _ask("番号を入力", "3")
+
+    argv = []
+    if choice == "1":
+        argv += ["--label", "starlink", "--collect", "starlink"]
+    elif choice == "2":
+        argv += ["--label", "oneweb_kymeta", "--collect", "kymeta"]
+    else:
+        argv += ["--label", "measure"]
+
+    print("\n測定時間(下り・上りそれぞれ)。例: 300、10m(10分)、1h(1時間)")
+    duration = _ask("測定時間", "10m")
+    argv += ["--duration", duration]
+
+    print("\n測定方向: both=下り→上りの順に両方 / down=下りのみ / up=上りのみ")
+    direction = _ask("方向", "both")
+    argv += ["--direction", direction]
+
+    print("\n次のコマンドと同じ内容で実行します:")
+    print(f"  python -m leo_analyzer {' '.join(argv)}\n")
+    return argv
+
+
 def main(argv=None):
+    if argv is None and len(sys.argv) == 1 and sys.stdin.isatty():
+        argv = interactive_args()
     args = build_parser().parse_args(argv)
     try:
         asyncio.run(run(args))

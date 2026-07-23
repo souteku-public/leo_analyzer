@@ -1,122 +1,215 @@
-# leo_analyzer
+# leo_analyzer — LEO衛星回線 スループット測定ツール
 
-LEO 衛星回線(Starlink / OneWeb)のスループットを 1 秒解像度で測定し、
-同時にアンテナのテレメトリ情報を CSV に記録するツールです。
+Starlink / OneWeb などのLEO衛星回線の**実効スループット(下り・上り)を
+1秒ごとに測定**し、同時に**アンテナの状態情報も1秒ごとにCSV記録**する
+ツールです。測定結果はすべてCSVファイルで保存されるので、Excelでそのまま
+開いてグラフ化できます。
 
-## 測定の考え方
+---
 
-衛星区間(アンテナ〜衛星〜地上局)だけを単独で測ることはエンドポイントからは
-できないため、**対向を十分に太い回線のサーバーにしてエンドツーエンドで測り、
-ボトルネックである衛星リンクの実効スループットとみなす** 方式をとります。
+## 1. 必要なもの
 
-- 対向は Cloudflare のスピードテスト用エンドポイント(`speed.cloudflare.com`)。
-  世界中の PoP にエニーキャストされるため、LEO の地上局から近い経路になりやすく、
-  回線側がボトルネックになる条件を満たしやすい
-- LEO は RTT 変動・約 15 秒周期の衛星ハンドオーバーがあるため、単一 TCP では
-  実力が出ない。**並列 HTTP ストリーム(既定 8 本)の合計**で飽和させる
-- 毎秒の転送バイト数を集計して Mbps を記録。負荷中のレイテンシ(loaded latency)も
-  毎秒 1 回の軽量プローブで記録し、ハンドオーバーによる落ち込みを観測できる
-- クライアントから外向きに接続するだけなので、**グローバル IP が固定でも可変
-  (CGNAT)でも動作する**
+- Windows / Mac / Linux のPC(ノートPCでOK)
+- そのPCが**測定したい衛星回線経由でインターネットに接続されている**こと
+- Python 3.9以上(インストール方法は下記)
 
-## インストール
+## 2. インストール手順
 
-Python 3.9 以上。
+### 2-1. Pythonを入れる(未インストールの場合)
+
+**Windows:**
+
+1. https://www.python.org/downloads/ を開き「Download Python 3.x.x」をクリック
+2. ダウンロードしたインストーラーを実行
+3. **最初の画面で必ず「Add python.exe to PATH」にチェック**を入れてから
+   「Install Now」をクリック
+4. 確認: スタートメニューから「コマンドプロンプト」を開き、
+   `python --version` と入力してEnter。`Python 3.11.x` のように表示されればOK
+
+**Mac:**
+
+ターミナルを開いて `python3 --version` と入力。バージョンが表示されればOK。
+表示されない場合は https://www.python.org/downloads/ からインストール。
+
+### 2-2. このツールを入手する
+
+**Gitを使わない場合(簡単):**
+
+1. GitHubのリポジトリページで緑色の「Code」ボタン →「Download ZIP」
+2. ZIPを展開し、`leo_analyzer` フォルダを分かりやすい場所
+   (例: デスクトップ)に置く
+
+**Gitを使う場合:**
 
 ```bash
+git clone <このリポジトリのURL>
+```
+
+### 2-3. 必要なライブラリを入れる
+
+コマンドプロンプト(Macはターミナル)で `leo_analyzer` フォルダに移動して
+1行実行するだけです:
+
+```bash
+cd Desktop\leo_analyzer        ← 置いた場所に合わせて変更(Macは cd Desktop/leo_analyzer)
 pip install -r requirements.txt
 ```
 
-Starlink テレメトリ収集(`--collect starlink`)を使わない場合は
-`aiohttp` と `PyYAML` だけで動作します。
+`pip` が見つからないと言われた場合は `python -m pip install -r requirements.txt`
+を試してください。
 
-## 使い方
+これでインストールは完了です。
 
-### スループット測定のみ
+---
+
+## 3. 使い方(いちばん簡単な方法)
+
+**Windowsの場合: フォルダ内の `measure.bat` をダブルクリック**するだけで
+起動します。あとは画面の質問に答えるだけです。
+
+コマンドで起動する場合も、引数なしで実行すると同じ対話モードになります:
 
 ```bash
-python -m leo_analyzer --label starlink_mini --duration 60
+python -m leo_analyzer
 ```
 
-下り 60 秒 → 上り 60 秒を測定し、`results/<UTC時刻>_starlink_mini/` に出力します。
+```
+============================================================
+ LEO回線 スループット測定ツール
+============================================================
+そのままEnterを押すと [ ] 内の既定値が使われます。
 
-主なオプション:
+測定する回線を選んでください:
+  1) Starlink        (アンテナ情報も同時記録)
+  2) OneWeb Kymeta   (アンテナ情報も同時記録)
+  3) OneWeb Intellian / その他 (速度測定のみ)
+番号を入力 [3]: 1
+
+測定時間(下り・上りそれぞれ)。例: 300、10m(10分)、1h(1時間)
+測定時間 [10m]: 30m
+
+測定方向: both=下り→上りの順に両方 / down=下りのみ / up=上りのみ
+方向 [both]:
+```
+
+これで測定が始まり、画面に1秒ごとの速度が表示されます。
+測定を途中でやめたいときは `Ctrl + C` を押してください
+(それまでのデータはちゃんと保存されます)。
+
+## 4. 測定時間について
+
+- `--duration`(対話モードの「測定時間」)は**下り・上りそれぞれの時間**です。
+  `both` で30分を指定すると、合計約1時間の測定になります
+- 秒数のほか `10m`(10分)、`1h`(1時間)のような指定ができます
+- LEO回線は約15秒〜数分周期の衛星ハンドオーバーで速度が変動するため、
+  **最低でも5〜10分、傾向をしっかり見るなら30分〜1時間以上**をおすすめします
+  (既定値は5分です)
+
+## 5. コマンドで細かく指定する場合
+
+```bash
+# Starlink: 30分ずつ下り/上り + アンテナ情報記録
+python -m leo_analyzer --label starlink --duration 30m --collect starlink
+
+# OneWeb + Kymeta: 1時間ずつ + アンテナ情報記録(設定ファイル不要)
+python -m leo_analyzer --label oneweb_kymeta --duration 1h --collect kymeta
+
+# OneWeb + Intellian: 測定のみ、下りだけ10分
+python -m leo_analyzer --label oneweb_intellian --duration 10m --direction down
+```
 
 | オプション | 既定値 | 説明 |
 |---|---|---|
-| `--duration` | 60 | 方向ごとの測定秒数 |
-| `--streams` | 8 | 並列 HTTP ストリーム数 |
+| `--duration` | 300(5分) | 方向ごとの測定時間(`90s` / `10m` / `1h` 形式可) |
 | `--direction` | both | `down` / `up` / `both` |
-| `--outdir` | results | 出力先ベースディレクトリ |
-| `--label` | run | 出力ディレクトリ名に付くラベル |
+| `--streams` | 8 | 並列HTTPストリーム数(通常は変更不要) |
+| `--label` | run | 出力フォルダ名に付くラベル |
+| `--outdir` | results | 出力先フォルダ |
+| `--collect` | なし | `starlink` / `kymeta`(繰り返し指定可) |
+| `--collect-only` | — | 速度測定なしでアンテナ情報だけ記録 |
 
-### Starlink Mini のテレメトリを同時記録
+## 6. 測定結果の見方
 
-Starlink の LAN 内から実行してください(ディッシュの gRPC
-`192.168.100.1:9200` に到達できる必要があります)。
+測定が終わると `results/<日時>_<ラベル>/` フォルダに保存されます:
 
-```bash
-python -m leo_analyzer --label starlink_mini --duration 60 --collect starlink
+| ファイル | 内容 |
+|---|---|
+| `throughput.csv` | 1秒ごとの下り/上り速度(Mbps)と応答時間(ms) |
+| `starlink_status.csv` | Starlinkアンテナの1秒ごとの状態(SNR、遮蔽率、衛星との通信品質など) |
+| `kymeta_status.csv` | Kymetaアンテナの1秒ごとの状態(CNR、ビーム方向、GPS位置など) |
+| `summary.json` | 平均・最大・最小などのまとめ |
+
+CSVはExcelでそのまま開けます。すべてのCSVに共通の時刻列
+(`timestamp_utc`=世界標準時、`epoch`=通し秒)があるので、速度と
+アンテナ状態を時刻で突き合わせてグラフにできます。
+
+`throughput.csv` の例:
+
+```
+timestamp_utc,epoch,phase,mbps_down,mbps_up,latency_ms
+2026-07-23T07:29:57.000Z,1784791797.001,download,182.45,0.0,63.7
 ```
 
-ディッシュから毎秒取得した状態(`downlink_throughput_bps`,
-`uplink_throughput_bps`, `pop_ping_latency_ms`, `pop_ping_drop_rate`,
-遮蔽率、ボアサイト方位/仰角、SNRフラグ等)が `starlink_status.csv` に
-全フィールド展開で記録されます。ルーターをバイパスしている場合も
-`--starlink-addr` でアドレスを変更できます。
+- `phase` … `download`(下り測定中)/ `upload`(上り測定中)
+- `latency_ms` … 負荷をかけた状態での応答時間。ハンドオーバーの瞬間に
+  跳ね上がるのが見えます
 
-### OneWeb (Kymeta) のテレメトリを同時記録
+## 7. アンテナ情報の記録について
 
-Kymeta は WebGUI の背後にある JSON API を毎秒ポーリングします。
-設定ファイルなしでそのまま動きます:
+### Starlink
 
-```bash
-python -m leo_analyzer --label oneweb_kymeta --duration 60 --collect kymeta
-```
+Starlinkのルーター/アンテナのLANに接続したPCから実行してください。
+アンテナ(`192.168.100.1`)から毎秒、SNR・POP応答時間・パケットロス率・
+遮蔽率・アンテナ向きなどを取得して記録します。特別な設定は不要です。
 
-デフォルトで `https://192.168.44.2` に工場出荷の管理ログイン
-(admin / 2Cfg^Ant)で接続し、よくある API パス(`/api/status` 等
-約20候補)を起動時に自動探索して、JSON を返したエンドポイントを
-毎秒記録します。Basic 認証が拒否された場合はフォームログインも
-自動で試行します。
+### OneWeb Kymeta(Hawk u8)
 
-事前にどのエンドポイントが見つかるか確認するには:
+設定不要でそのまま動きます。アンテナの管理画面
+(`https://192.168.44.2`、工場出荷のadminログイン)に自動接続し、
+APIを自動探索してCNR・キャリアロック状態・ビーム方向・GPS位置などを
+毎秒記録します。
+
+事前に何が取れるか確認したいときは:
 
 ```bash
 python -m leo_analyzer --kymeta-probe
 ```
 
-探索結果(取得できる列の一覧)と、そのまま使える YAML スニペットが
-表示されます。自動探索で見つからない場合は、ブラウザで WebGUI を開き
-開発者ツール(F12)→ネットワークタブで GUI が定期取得している JSON の
-URL を確認し、`config/kymeta.example.yaml` をコピーした
-`config/kymeta.yaml` に記入して `--kymeta-config config/kymeta.yaml` を
-付けて実行してください(IP・認証情報を変えたい場合も同様)。
+自動で見つからない場合や、パスワードを変更している場合は
+`config/kymeta.example.yaml` をコピーして `config/kymeta.yaml` を作り、
+中身を書き換えて `--kymeta-config config/kymeta.yaml` を付けて実行して
+ください。
 
-OneWeb (Intellian) はアンテナ情報を取得できないため、スループット測定のみ
-(`--collect` なし)で実行してください。
+### OneWeb Intellian
 
-### 測定なしでテレメトリだけ記録
+アンテナ情報の取得手段がないため、速度測定のみ対応です。
 
-```bash
-python -m leo_analyzer --label idle_watch --duration 300 \
-    --collect starlink --collect-only
-```
+## 8. うまく動かないとき
 
-## 出力
+| 症状 | 対処 |
+|---|---|
+| `python` が見つからない | Pythonインストール時に「Add python.exe to PATH」を入れ忘れた可能性。入れ直すのが早いです。Windowsでは `py -m leo_analyzer` も試してください |
+| `pip` が見つからない | `python -m pip install -r requirements.txt` を実行 |
+| 速度が明らかに低い | PCが衛星回線「経由」でネットに出ているか確認(社内LANやテザリング経由になっていないか)。PCのWi-Fiではなく有線接続推奨 |
+| Starlinkの情報が取れない | Starlink のLAN内から実行しているか確認。`192.168.100.1` にブラウザでアクセスできるかも確認 |
+| Kymetaの情報が取れない | `https://192.168.44.2` にブラウザでログインできるか確認。できる場合はWebGUIのHelpページ→APIタブでエンドポイントを確認し `config/kymeta.yaml` に記入 |
+| 測定を途中でやめたい | `Ctrl + C`(それまでのデータは保存されます) |
 
-`results/<UTC時刻>_<label>/` 配下:
+## 9. 測定のしくみ(技術メモ)
 
-- `throughput.csv` — 1 秒ごとの `timestamp_utc, epoch, phase, mbps_down, mbps_up, latency_ms`
-- `starlink_status.csv` / `kymeta_status.csv` — 1 秒ごとのアンテナテレメトリ
-  (全ファイル共通で `timestamp_utc` / `epoch` 列を持つため突合可能)
-- `summary.json` — 平均 / 最大 / 最小 / p10 / p50 / p90 などの統計
+衛星区間だけを単独で測ることはできないため、**十分に太い回線を持つ
+対向サーバー(Cloudflare、世界中にPoPあり)に対してエンドツーエンドで
+測り、ボトルネックである衛星リンクの実効スループットとみなす**方式です。
 
-CSV はすべて壁時計の秒境界に同期してサンプリングしているため、
-スループットとアンテナテレメトリを epoch 列でそのまま JOIN できます。
+- LEOはRTT変動・ハンドオーバーがあるため単一TCPでは実力が出ません。
+  並列HTTPストリーム(既定8本)の合計で回線を飽和させます
+- すべてクライアントから外向きの接続なので、**グローバルIPが固定でも
+  可変(CGNAT)でも動作**します
+- 毎秒の転送バイト数を壁時計の秒境界で集計するため、アンテナ情報CSVと
+  1秒単位でそのまま突合できます
 
-## 今後の拡張(未実装)
+## 10. 今後の拡張(未実装)
 
-- TLE(CelesTrak 等)から Starlink / OneWeb 衛星の軌道を取得し、
+- TLE(CelesTrak等)からStarlink / OneWeb衛星の軌道を取得し、
   ハンドオーバータイミングを予測して測定結果と重ねる
-- 自前サーバー(iperf3 / UDP レートランプ)モード
+- 自前サーバー(iperf3 / UDPレートランプ)モード
