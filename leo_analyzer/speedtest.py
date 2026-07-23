@@ -89,7 +89,7 @@ async def _latency_probe(session, state, stop):
         await asyncio.sleep(max(0.0, 1.0 - (time.perf_counter() - t0)))
 
 
-async def _sampler(state, logger, stop, results):
+async def _sampler(state, logger, stop, results, latencies):
     prev_down = state.bytes_down
     prev_up = state.bytes_up
     next_t = int(time.time()) + 1
@@ -113,6 +113,8 @@ async def _sampler(state, logger, stop, results):
         if state.phase in results:
             key = "mbps_down" if state.phase == "download" else "mbps_up"
             results[state.phase].append(row[key])
+        if lat is not None and state.phase in latencies:
+            latencies[state.phase].append(lat)
         print(
             f"[{row['timestamp_utc']}] {state.phase:>8} "
             f"down={mbps_down:8.2f} Mbps  up={mbps_up:7.2f} Mbps  "
@@ -125,30 +127,54 @@ async def run_speedtest(
     duration: int = 60,
     streams: int = 8,
     direction: str = "both",
+    baseline: int = 15,
 ) -> dict:
-    """Run download/upload phases; returns per-phase summary stats."""
+    """Run baseline/download/upload phases; returns per-phase summary stats.
+
+    `baseline` seconds of latency-only probing (no load) run before the
+    first transfer phase and between download and upload, so each run
+    records idle RTT alongside loaded RTT. Set 0 to skip.
+    """
     state = _State()
     stop_all = asyncio.Event()
     logger = CsvLogger(csv_path)
     results = {"download": [], "upload": []}
+    latencies = {"baseline": [], "download": [], "upload": []}
 
     connector = aiohttp.TCPConnector(limit=streams * 2 + 4, ssl=True)
     timeout = aiohttp.ClientTimeout(total=None, sock_connect=15, sock_read=60)
     async with aiohttp.ClientSession(
         connector=connector, timeout=timeout, trust_env=True
     ) as session:
-        sampler_task = asyncio.create_task(_sampler(state, logger, stop_all, results))
+        # warm up the probe connection (TCP+TLS handshake) so the first
+        # baseline sample measures RTT, not connection setup
+        try:
+            async with session.get(PROBE_URL) as resp:
+                await resp.read()
+        except Exception:
+            pass
+
+        sampler_task = asyncio.create_task(
+            _sampler(state, logger, stop_all, results, latencies)
+        )
         probe_task = asyncio.create_task(_latency_probe(session, state, stop_all))
 
         phases = []
+        if baseline > 0:
+            phases.append(("baseline", None))
         if direction in ("both", "down"):
             phases.append(("download", _download_worker))
+        if direction == "both" and baseline > 0:
+            phases.append(("baseline", None))
         if direction in ("both", "up"):
             phases.append(("upload", _upload_worker))
 
         try:
             for phase_name, worker in phases:
                 state.phase = phase_name
+                if worker is None:  # latency-only baseline, no load
+                    await asyncio.sleep(baseline)
+                    continue
                 phase_stop = asyncio.Event()
                 workers = [
                     asyncio.create_task(worker(session, state, phase_stop))
@@ -172,4 +198,13 @@ async def run_speedtest(
         summary["download_mbps"] = summarize(results["download"])
     if results["upload"]:
         summary["upload_mbps"] = summarize(results["upload"])
+    lat = {}
+    if latencies["baseline"]:
+        lat["idle"] = summarize(latencies["baseline"])
+    if latencies["download"]:
+        lat["download_loaded"] = summarize(latencies["download"])
+    if latencies["upload"]:
+        lat["upload_loaded"] = summarize(latencies["upload"])
+    if lat:
+        summary["latency_ms"] = lat
     return summary

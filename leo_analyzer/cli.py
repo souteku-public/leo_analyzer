@@ -17,7 +17,7 @@ from pathlib import Path
 from .speedtest import run_speedtest
 
 
-def parse_duration(value) -> int:
+def parse_duration(value, minimum: int = 1) -> int:
     """'300' -> 300, '90s' -> 90, '10m' -> 600, '1.5h' -> 5400."""
     if isinstance(value, int):
         return value
@@ -33,8 +33,10 @@ def parse_duration(value) -> int:
         raise argparse.ArgumentTypeError(
             f"invalid duration: {value!r} (examples: 300, 90s, 10m, 1h)"
         )
-    if seconds < 1:
-        raise argparse.ArgumentTypeError("duration must be at least 1 second")
+    if seconds < minimum:
+        raise argparse.ArgumentTypeError(
+            f"duration must be at least {minimum} second(s)"
+        )
     return seconds
 
 
@@ -58,6 +60,14 @@ def build_parser():
         metavar="TIME",
         help="measurement time per direction: seconds, or with a unit "
         "like 90s / 10m / 1h (default: 300 = 5 minutes)",
+    )
+    p.add_argument(
+        "--baseline",
+        type=lambda v: parse_duration(v, minimum=0),
+        default="15",
+        metavar="TIME",
+        help="idle RTT baseline before the first transfer and between "
+        "directions, latency probe only (default: 15s; 0 to disable)",
     )
     p.add_argument(
         "--streams",
@@ -189,6 +199,7 @@ async def run(args):
         "label": args.label,
         "started_utc": datetime.now(timezone.utc).isoformat(),
         "duration_per_direction_s": args.duration,
+        "baseline_s": args.baseline,
         "streams": args.streams,
         "direction": args.direction,
         "collectors": [c.name for c in collectors],
@@ -205,6 +216,7 @@ async def run(args):
                 duration=args.duration,
                 streams=args.streams,
                 direction=args.direction,
+                baseline=args.baseline,
             )
             summary.update(result)
     except KeyboardInterrupt:
