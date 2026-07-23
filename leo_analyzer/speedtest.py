@@ -22,12 +22,20 @@ DOWN_REQUEST_MIN = 4 * 1024 * 1024  # floor when shrinking after HTTP errors
 UP_REQUEST_BYTES = 50 * 1024 * 1024  # per-POST payload, re-posted until stop
 CHUNK = 64 * 1024
 
+# each latency probe gets its own deadline so an outage (e.g. satellite
+# handover) is detected within a few seconds instead of hanging
+PROBE_TIMEOUT_S = 4.0
+# a probe result older than this is treated as "no measurement" for that
+# second, so stale values never mask an outage
+PROBE_STALE_S = 3.0
+
 
 class _State:
     def __init__(self):
         self.bytes_down = 0
         self.bytes_up = 0
         self.latency_ms = None
+        self.latency_ts = None  # perf_counter of the last probe verdict
         self.phase = "idle"
         self.down_request_bytes = DOWN_REQUEST_BYTES
 
@@ -76,20 +84,22 @@ async def _upload_worker(session, state, stop):
 
 
 async def _latency_probe(session, state, stop):
+    probe_timeout = aiohttp.ClientTimeout(total=PROBE_TIMEOUT_S)
     while not stop.is_set():
         t0 = time.perf_counter()
         try:
-            async with session.get(PROBE_URL) as resp:
+            async with session.get(PROBE_URL, timeout=probe_timeout) as resp:
                 await resp.read()
             state.latency_ms = (time.perf_counter() - t0) * 1000.0
         except asyncio.CancelledError:
             return
         except Exception:
-            state.latency_ms = None
+            state.latency_ms = None  # unreachable this round (e.g. handover)
+        state.latency_ts = time.perf_counter()
         await asyncio.sleep(max(0.0, 1.0 - (time.perf_counter() - t0)))
 
 
-async def _sampler(state, logger, stop, results, latencies):
+async def _sampler(state, logger, stop, results, latencies, lat_missing):
     prev_down = state.bytes_down
     prev_up = state.bytes_up
     next_t = int(time.time()) + 1
@@ -101,6 +111,11 @@ async def _sampler(state, logger, stop, results, latencies):
         mbps_up = (u - prev_up) * 8 / 1e6
         prev_down, prev_up = d, u
         lat = state.latency_ms
+        if lat is not None and (
+            state.latency_ts is None
+            or time.perf_counter() - state.latency_ts > PROBE_STALE_S
+        ):
+            lat = None  # probe is hanging: treat this second as unreachable
         row = {
             "timestamp_utc": utc_now_iso(),
             "epoch": round(time.time(), 3),
@@ -113,8 +128,11 @@ async def _sampler(state, logger, stop, results, latencies):
         if state.phase in results:
             key = "mbps_down" if state.phase == "download" else "mbps_up"
             results[state.phase].append(row[key])
-        if lat is not None and state.phase in latencies:
-            latencies[state.phase].append(lat)
+        if state.phase in latencies:
+            if lat is not None:
+                latencies[state.phase].append(lat)
+            else:
+                lat_missing[state.phase] += 1
         print(
             f"[{row['timestamp_utc']}] {state.phase:>8} "
             f"down={mbps_down:8.2f} Mbps  up={mbps_up:7.2f} Mbps  "
@@ -140,6 +158,7 @@ async def run_speedtest(
     logger = CsvLogger(csv_path)
     results = {"download": [], "upload": []}
     latencies = {"baseline": [], "download": [], "upload": []}
+    lat_missing = {"baseline": 0, "download": 0, "upload": 0}
 
     connector = aiohttp.TCPConnector(limit=streams * 2 + 4, ssl=True)
     timeout = aiohttp.ClientTimeout(total=None, sock_connect=15, sock_read=60)
@@ -155,7 +174,7 @@ async def run_speedtest(
             pass
 
         sampler_task = asyncio.create_task(
-            _sampler(state, logger, stop_all, results, latencies)
+            _sampler(state, logger, stop_all, results, latencies, lat_missing)
         )
         probe_task = asyncio.create_task(_latency_probe(session, state, stop_all))
 
@@ -199,12 +218,17 @@ async def run_speedtest(
     if results["upload"]:
         summary["upload_mbps"] = summarize(results["upload"])
     lat = {}
-    if latencies["baseline"]:
-        lat["idle"] = summarize(latencies["baseline"])
-    if latencies["download"]:
-        lat["download_loaded"] = summarize(latencies["download"])
-    if latencies["upload"]:
-        lat["upload_loaded"] = summarize(latencies["upload"])
+    for phase, key in (
+        ("baseline", "idle"),
+        ("download", "download_loaded"),
+        ("upload", "upload_loaded"),
+    ):
+        if latencies[phase] or lat_missing[phase]:
+            stats = summarize(latencies[phase])
+            # seconds with no reachable probe (e.g. satellite handover);
+            # these are excluded from avg/min/max above
+            stats["unreachable_s"] = lat_missing[phase]
+            lat[key] = stats
     if lat:
         summary["latency_ms"] = lat
     return summary

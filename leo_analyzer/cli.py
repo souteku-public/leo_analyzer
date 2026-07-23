@@ -64,10 +64,12 @@ def build_parser():
     p.add_argument(
         "--baseline",
         type=lambda v: parse_duration(v, minimum=0),
-        default="15",
+        default="5m",
         metavar="TIME",
         help="idle RTT baseline before the first transfer and between "
-        "directions, latency probe only (default: 15s; 0 to disable)",
+        "directions, latency probe only (default: 5m; 0 to disable). "
+        "Unreachable seconds (handovers) are excluded from the stats "
+        "and counted separately",
     )
     p.add_argument(
         "--streams",
@@ -266,6 +268,10 @@ def interactive_args():
     print("\n測定時間(下り・上りそれぞれ)。例: 300、10m(10分)、1h(1時間)")
     duration = _ask("測定時間", "10m")
     argv += ["--duration", duration]
+
+    print("\n無負荷でのRTT測定時間(測定前と下り→上りの間の2回)。0で省略")
+    baseline = _ask("アイドルRTT測定時間", "5m")
+    argv += ["--baseline", baseline]
 
     print("\n測定方向: both=下り→上りの順に両方 / down=下りのみ / up=上りのみ")
     direction = _ask("方向", "both")
