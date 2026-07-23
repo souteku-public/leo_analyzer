@@ -68,17 +68,30 @@ python -m leo_analyzer --label starlink_mini --duration 60 --collect starlink
 ### OneWeb (Kymeta) のテレメトリを同時記録
 
 Kymeta は WebGUI の背後にある JSON API を毎秒ポーリングします。
-エンドポイントは機種・ファームで異なるため YAML で設定します。
-
-1. `config/kymeta.example.yaml` を `config/kymeta.yaml` にコピー
-2. ブラウザで WebGUI を開き、開発者ツール(F12)→ネットワークタブで
-   GUI が定期取得している JSON の URL とログイン方式を確認して記入
-3. 実行:
+設定ファイルなしでそのまま動きます:
 
 ```bash
-python -m leo_analyzer --label oneweb_kymeta --duration 60 \
-    --collect kymeta --kymeta-config config/kymeta.yaml
+python -m leo_analyzer --label oneweb_kymeta --duration 60 --collect kymeta
 ```
+
+デフォルトで `https://192.168.44.2` に工場出荷の管理ログイン
+(admin / 2Cfg^Ant)で接続し、よくある API パス(`/api/status` 等
+約20候補)を起動時に自動探索して、JSON を返したエンドポイントを
+毎秒記録します。Basic 認証が拒否された場合はフォームログインも
+自動で試行します。
+
+事前にどのエンドポイントが見つかるか確認するには:
+
+```bash
+python -m leo_analyzer --kymeta-probe
+```
+
+探索結果(取得できる列の一覧)と、そのまま使える YAML スニペットが
+表示されます。自動探索で見つからない場合は、ブラウザで WebGUI を開き
+開発者ツール(F12)→ネットワークタブで GUI が定期取得している JSON の
+URL を確認し、`config/kymeta.example.yaml` をコピーした
+`config/kymeta.yaml` に記入して `--kymeta-config config/kymeta.yaml` を
+付けて実行してください(IP・認証情報を変えたい場合も同様)。
 
 OneWeb (Intellian) はアンテナ情報を取得できないため、スループット測定のみ
 (`--collect` なし)で実行してください。

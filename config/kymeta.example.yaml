@@ -1,33 +1,38 @@
 # Kymeta アンテナ テレメトリ収集の設定例
 #
-# Kymeta の WebGUI は内部的に JSON API を呼んでいます。実機のブラウザで
-# WebGUI を開き、開発者ツール (F12) の「ネットワーク」タブで
-# GUI が定期的に叩いている JSON エンドポイントの URL とログイン方式を
-# 確認し、このファイルに反映してください。
+# 【設定ファイルなしでも動きます】
+# --collect kymeta を設定ファイルなしで実行すると、以下のデフォルトで
+# 接続し、よくある API パスを自動探索して JSON を返すものを毎秒記録します。
+#   base_url: https://192.168.44.2 / admin / 2Cfg^Ant (工場出荷デフォルト)
+#
+# 自動探索で見つからない場合や、記録するエンドポイントを固定したい場合に
+# このファイルをコピーして config/kymeta.yaml を作成してください。
+# 実機のブラウザで WebGUI を開き、開発者ツール (F12) の「ネットワーク」
+# タブで GUI が定期的に叩いている JSON エンドポイントを確認できます。
+# `python -m leo_analyzer --kymeta-probe` で探索結果と設定スニペットを
+# 表示することもできます。
 
-base_url: "https://192.168.1.100"   # アンテナの固定IP
-verify_ssl: false                    # 自己署名証明書のため通常 false
+base_url: "https://192.168.44.2"   # アンテナの管理IP
+verify_ssl: false                   # 自己署名証明書のため通常 false
 timeout: 5.0
 
 auth:
   # --- HTTP Basic 認証の場合 ---
   type: basic
   username: "admin"
-  password: "CHANGE_ME"
+  password: "2Cfg^Ant"
 
   # --- フォーム/トークンログインの場合(上の type: basic を消して使う) ---
   # type: form
   # login_path: "/api/login"
-  # payload: { username: "admin", password: "CHANGE_ME" }
+  # payload: { username: "admin", password: "2Cfg^Ant" }
   # token_field: "token"            # ログイン応答JSON内のトークンのキー(ネストは a.b.c)
   # token_header: "Authorization"   # トークンを載せるヘッダ名
   # token_prefix: "Bearer "
   # ※ Cookie セッションのみの場合は token_field を省略(Cookieは自動保持)
 
-# 1秒ごとに取得する JSON エンドポイント。複数指定可(1行のCSVにマージ、
-# 列名は "<name>.<jsonキー>" になる)
-endpoints:
-  - name: status
-    path: "/api/status"
-  # - name: tracking
-  #   path: "/api/tracking"
+# 1秒ごとに取得する JSON エンドポイント。空にすると起動時に自動探索する。
+# 複数指定可(1行のCSVにマージ、列名は "<name>.<jsonキー>" になる)
+endpoints: []
+#  - name: status
+#    path: "/api/status"
