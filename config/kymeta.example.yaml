@@ -1,0 +1,33 @@
+# Kymeta アンテナ テレメトリ収集の設定例
+#
+# Kymeta の WebGUI は内部的に JSON API を呼んでいます。実機のブラウザで
+# WebGUI を開き、開発者ツール (F12) の「ネットワーク」タブで
+# GUI が定期的に叩いている JSON エンドポイントの URL とログイン方式を
+# 確認し、このファイルに反映してください。
+
+base_url: "https://192.168.1.100"   # アンテナの固定IP
+verify_ssl: false                    # 自己署名証明書のため通常 false
+timeout: 5.0
+
+auth:
+  # --- HTTP Basic 認証の場合 ---
+  type: basic
+  username: "admin"
+  password: "CHANGE_ME"
+
+  # --- フォーム/トークンログインの場合(上の type: basic を消して使う) ---
+  # type: form
+  # login_path: "/api/login"
+  # payload: { username: "admin", password: "CHANGE_ME" }
+  # token_field: "token"            # ログイン応答JSON内のトークンのキー(ネストは a.b.c)
+  # token_header: "Authorization"   # トークンを載せるヘッダ名
+  # token_prefix: "Bearer "
+  # ※ Cookie セッションのみの場合は token_field を省略(Cookieは自動保持)
+
+# 1秒ごとに取得する JSON エンドポイント。複数指定可(1行のCSVにマージ、
+# 列名は "<name>.<jsonキー>" になる)
+endpoints:
+  - name: status
+    path: "/api/status"
+  # - name: tracking
+  #   path: "/api/tracking"
