@@ -44,11 +44,20 @@ OBSERVED_ENDPOINT_NAMES = [
     "time?gps=false",
     "adc-data",          # spectrum bins (Spectrum page, large payload)
 ]
-_PREFIX_BASES = ["/", "/api/", "/api/v1/", "/rest/"]
+# Confirmed via curl capture on a real u8 (sw 2.6.6.62): the API base is
+# /v1/ with sub-groups, e.g. /v1/internal/status and /v1/status/terminal.
+KNOWN_PATHS = [
+    "/v1/internal/status",
+    "/v1/status/terminal",
+]
+_PREFIX_BASES = [
+    "/v1/", "/v1/status/", "/v1/internal/",
+    "/", "/api/", "/api/v1/", "/rest/",
+]
 
 # Probed in order when no endpoints are configured. Paths returning JSON
 # (dict/list) are adopted for 1 Hz polling.
-CANDIDATE_STATUS_PATHS = [
+CANDIDATE_STATUS_PATHS = KNOWN_PATHS + [
     prefix + name
     for name in OBSERVED_ENDPOINT_NAMES
     for prefix in _PREFIX_BASES
@@ -86,6 +95,12 @@ CANDIDATE_STATUS_PATHS = [
 ]
 
 CANDIDATE_LOGIN_PATHS = [
+    "/v1/login",
+    "/v1/session",
+    "/v1/sessions",
+    "/v1/auth/login",
+    "/v1/users/login",
+    "/v1/internal/login",
     "/api/login",
     "/api/v1/login",
     "/api/session",
@@ -209,6 +224,9 @@ class KymetaCollector(Collector):
             timeout=timeout,
             cookie_jar=aiohttp.CookieJar(unsafe=True),
         )
+        # the real u8 GUI sends this on every request; some firmwares may
+        # gate on it, and it is harmless elsewhere
+        self._headers.setdefault("X-Requested-From", "gui")
 
         auth_type = self.auth_cfg.get("type", "none")
         if auth_type == "basic":
@@ -217,6 +235,19 @@ class KymetaCollector(Collector):
             )
         elif auth_type == "form":
             await self._login()
+        elif auth_type == "cookie":
+            # paste the browser's Cookie header value into the config —
+            # works without knowing the login endpoint (the u8 remember
+            # token is long-lived)
+            from http.cookies import SimpleCookie
+            from yarl import URL
+
+            jar_cookies = SimpleCookie()
+            jar_cookies.load(self.auth_cfg["cookie"])
+            self._session.cookie_jar.update_cookies(
+                {k: m.value for k, m in jar_cookies.items()},
+                response_url=URL(self.base_url),
+            )
         elif auth_type != "none":
             raise ValueError(f"unknown auth type: {auth_type}")
 
@@ -466,7 +497,7 @@ class KymetaCollector(Collector):
             for kwargs in ({"json": creds}, {"data": creds}):
                 try:
                     async with self._session.post(
-                        self._url(path), **kwargs
+                        self._url(path), headers=self._headers, **kwargs
                     ) as resp:
                         if resp.status not in (200, 201):
                             self.probe_log.append(
@@ -503,7 +534,9 @@ class KymetaCollector(Collector):
             "username": cfg.get("username"),
             "password": cfg.get("password"),
         }
-        async with self._session.post(url, json=payload) as resp:
+        async with self._session.post(
+            url, json=payload, headers=self._headers
+        ) as resp:
             resp.raise_for_status()
             try:
                 body = await resp.json(content_type=None)
