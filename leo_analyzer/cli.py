@@ -191,8 +191,28 @@ async def kymeta_probe(args):
     try:
         await collector.setup()
         sample = await collector.sample()
+    except Exception as e:
+        print("\n=== 探索の診断ログ ===")
+        for line in collector.probe_log:
+            print(" ", line)
+        print(f"\n探索失敗: {e}")
+        print(
+            "\n次のステップ:\n"
+            "  1) このPCのブラウザで " + collector.base_url + " が開けるか確認\n"
+            "     開けない場合はネットワーク(接続ポート/VLAN)の問題です\n"
+            "  2) 開ける場合は F12 -> ネットワーク -> Fetch/XHR で、"
+            "GUIが定期取得しているURLを確認\n"
+            "     (plots/spectrumページはWSタブも確認)\n"
+            "  3) 見つけたURLを config/kymeta.yaml の endpoints / "
+            "stream_endpoints に記入して再実行"
+        )
+        sys.exit(1)
     finally:
         await collector.teardown()
+
+    print("\n=== 探索の診断ログ ===")
+    for line in collector.probe_log:
+        print(" ", line)
 
     print(f"\nprobed {collector.base_url}: {len(collector.endpoints)} endpoint(s)")
     print(f"columns per sample: {len(sample)}")

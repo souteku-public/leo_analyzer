@@ -156,6 +156,7 @@ class KymetaCollector(Collector):
         self._jsonl_files = {}
         self._ws_tasks = []
         self._ws_stop = None
+        self.probe_log = []  # human-readable trail of what discovery tried
 
     async def setup(self):
         connector = aiohttp.TCPConnector(ssl=self.verify_ssl or False)
@@ -211,7 +212,13 @@ class KymetaCollector(Collector):
                 texts.append(html)
         except Exception:
             return [], [], []
-        for src in _SCRIPT_SRC_RE.findall(html)[:12]:
+        # <script src> tags plus any *.js file referenced anywhere in the
+        # page (covers dynamically imported chunk lists)
+        srcs = _SCRIPT_SRC_RE.findall(html)
+        srcs += re.findall(r'["\']([A-Za-z0-9_\-./]{2,120}\.js)["\']', html)
+        srcs = list(dict.fromkeys(srcs))
+        fetched = 0
+        for src in srcs[:12]:
             if src.startswith(("http://", "https://", "//")):
                 continue  # external script, not the antenna's own bundle
             url = self.base_url + "/" + src.lstrip("/")
@@ -224,8 +231,12 @@ class KymetaCollector(Collector):
                             "utf-8", errors="ignore"
                         )
                     )
+                    fetched += 1
             except Exception:
                 continue
+        self.probe_log.append(
+            f"WebGUIアプリ解析: スクリプト参照 {len(srcs)} 件中 {fetched} 件取得"
+        )
 
         status_paths, login_paths, ws_paths = [], [], []
         seen = set()
@@ -246,10 +257,43 @@ class KymetaCollector(Collector):
                     continue
                 seen.add(match)
                 ws_paths.append(match)
+        self.probe_log.append(
+            f"WebGUIアプリからの抽出: APIパス {len(status_paths)} 件 / "
+            f"ログイン系 {len(login_paths)} 件 / WebSocket {len(ws_paths)} 件"
+        )
         return status_paths[:60], login_paths[:10], ws_paths[:10]
+
+    async def _ensure_reachable(self) -> bool:
+        """Confirm the base URL answers at all; fall back https<->http."""
+        candidates = [self.base_url]
+        if self.base_url.startswith("https://"):
+            candidates.append("http://" + self.base_url[len("https://"):])
+        elif self.base_url.startswith("http://"):
+            candidates.append("https://" + self.base_url[len("http://"):])
+        for base in candidates:
+            try:
+                async with self._session.get(base + "/") as resp:
+                    self.probe_log.append(f"GET {base}/ -> HTTP {resp.status}")
+                    if base != self.base_url:
+                        print(f"[kymeta] {self.base_url} に接続できないため {base} を使用します")
+                        self.base_url = base
+                    return True
+            except Exception as e:
+                self.probe_log.append(
+                    f"GET {base}/ -> 接続エラー ({type(e).__name__}: {e})"
+                )
+        return False
 
     async def discover(self) -> list:
         """Probe candidate paths; adopt every one that returns JSON."""
+        if not await self._ensure_reachable():
+            raise RuntimeError(
+                f"アンテナ({self.base_url})に接続できませんでした。"
+                "このPCがアンテナの管理ネットワーク(192.168.44.x)に届いているか、"
+                f"同じPCのブラウザで {self.base_url} が開けるか確認してください。"
+                "Hawk u8 はポートごとにネットワークが分かれているため、"
+                "接続ポート/VLANの確認も必要です"
+            )
         app_status, app_logins, app_ws = await self._harvest_app_paths()
         if app_status or app_logins or app_ws:
             print(
@@ -266,6 +310,7 @@ class KymetaCollector(Collector):
         for path in status_candidates:
             status, data = await self._try_json(path)
             if data is not None:
+                self.probe_log.append(f"{path}: JSON 取得成功")
                 found.append({
                     "name": _path_to_name(path),
                     "path": path,
@@ -273,6 +318,13 @@ class KymetaCollector(Collector):
                 })
             elif status in (401, 403):
                 denied += 1
+                self.probe_log.append(f"{path}: HTTP {status} (認証拒否)")
+            elif status == 200:
+                self.probe_log.append(f"{path}: HTTP 200 (JSONでない/画面のHTML)")
+            elif status is None:
+                self.probe_log.append(f"{path}: 接続エラー")
+            else:
+                self.probe_log.append(f"{path}: HTTP {status}")
 
         if not found and denied and self.auth_cfg.get("type") == "basic":
             # Auth rejected everywhere: try form logins (harvested paths
@@ -282,11 +334,19 @@ class KymetaCollector(Collector):
                 for path in status_candidates:
                     _, data = await self._try_json(path)
                     if data is not None:
+                        self.probe_log.append(
+                            f"{path}: JSON 取得成功(フォームログイン後)"
+                        )
                         found.append({
                             "name": _path_to_name(path),
                             "path": path,
                             "array": _find_numeric_array(data) is not None,
                         })
+            else:
+                self.probe_log.append(
+                    "フォームログイン: 全候補パスで失敗 "
+                    "(パスワード変更済み、または独自のログイン方式の可能性)"
+                )
 
         # adopt harvested websocket paths that actually accept a connection
         if not self.stream_endpoints:
@@ -300,10 +360,17 @@ class KymetaCollector(Collector):
                 )
 
         if not found and not self.stream_endpoints:
+            counts = {}
+            for line in self.probe_log:
+                key = line.split(": ", 1)[-1].split(" (")[0]
+                counts[key] = counts.get(key, 0) + 1
+            summary = ", ".join(f"{k} x{v}" for k, v in counts.items())
             raise RuntimeError(
-                f"no JSON endpoints discovered on {self.base_url}; open the WebGUI "
-                "in a browser, check the JSON URLs in DevTools (F12) -> Network, "
-                "and list them in a config file (see config/kymeta.example.yaml)"
+                f"{self.base_url} でJSONエンドポイントが見つかりませんでした"
+                f"(結果内訳: {summary})。"
+                "--kymeta-probe を実行すると試したパスごとの結果一覧が表示されます。"
+                "ブラウザのF12→ネットワークタブでWebGUIが叩いているJSONのURLが"
+                "分かれば config/kymeta.yaml に記入してください"
             )
         self.endpoints = found
         arrays = [e["path"] for e in found if e.get("array")]
