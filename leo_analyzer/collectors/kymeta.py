@@ -17,6 +17,7 @@ into one CSV row (keys prefixed with the endpoint name).
 """
 
 import json
+import re
 
 import aiohttp
 
@@ -60,6 +61,15 @@ CANDIDATE_LOGIN_PATHS = [
 ]
 
 TOKEN_FIELDS = ["token", "access_token", "accessToken", "sessionId", "session_id"]
+
+# The WebGUI is a single-page app (routes like /#/status are client-side
+# only). The real data endpoints are XHR paths embedded in its JS bundles,
+# so we download the bundles and harvest anything that looks like an API
+# path before probing.
+_SCRIPT_SRC_RE = re.compile(r'<script[^>]+src=["\']([^"\']+)["\']', re.I)
+_API_PATH_RE = re.compile(r'["\'`](/?(?:api|rest)/[A-Za-z0-9_\-./]{2,80})["\'`]')
+_LOGIN_HINT_RE = re.compile(r"login|auth|session|token", re.I)
+_BUNDLE_MAX_BYTES = 8 * 1024 * 1024
 
 
 def default_config() -> dict:
@@ -121,10 +131,66 @@ class KymetaCollector(Collector):
         if not self.endpoints:
             await self.discover()
 
+    async def _harvest_app_paths(self):
+        """Download the SPA's JS bundles and extract embedded API paths.
+
+        Returns (status_paths, login_paths), both deduped and ordered.
+        """
+        texts = []
+        try:
+            async with self._session.get(self.base_url + "/") as resp:
+                html = (await resp.content.read(_BUNDLE_MAX_BYTES)).decode(
+                    "utf-8", errors="ignore"
+                )
+                texts.append(html)
+        except Exception:
+            return [], []
+        for src in _SCRIPT_SRC_RE.findall(html)[:12]:
+            if src.startswith(("http://", "https://", "//")):
+                continue  # external script, not the antenna's own bundle
+            url = self.base_url + "/" + src.lstrip("/")
+            try:
+                async with self._session.get(url) as resp:
+                    if resp.status != 200:
+                        continue
+                    texts.append(
+                        (await resp.content.read(_BUNDLE_MAX_BYTES)).decode(
+                            "utf-8", errors="ignore"
+                        )
+                    )
+            except Exception:
+                continue
+
+        status_paths, login_paths = [], []
+        seen = set()
+        for text in texts:
+            for match in _API_PATH_RE.findall(text):
+                path = "/" + match.lstrip("/")
+                if "{" in path or path in seen:
+                    continue
+                seen.add(path)
+                if _LOGIN_HINT_RE.search(path):
+                    login_paths.append(path)
+                else:
+                    status_paths.append(path)
+        return status_paths[:60], login_paths[:10]
+
     async def discover(self) -> list:
         """Probe candidate paths; adopt every one that returns JSON."""
+        app_status, app_logins = await self._harvest_app_paths()
+        if app_status or app_logins:
+            print(
+                f"[kymeta] found {len(app_status) + len(app_logins)} API path(s) "
+                "embedded in the WebGUI app"
+            )
+        # paths harvested from the actual app first, generic guesses after
+        status_candidates = list(
+            dict.fromkeys(app_status + CANDIDATE_STATUS_PATHS)
+        )
+        login_candidates = list(dict.fromkeys(app_logins + CANDIDATE_LOGIN_PATHS))
+
         found, denied = [], 0
-        for path in CANDIDATE_STATUS_PATHS:
+        for path in status_candidates:
             status, data = await self._try_json(path)
             if data is not None:
                 found.append({"name": _path_to_name(path), "path": path})
@@ -132,11 +198,11 @@ class KymetaCollector(Collector):
                 denied += 1
 
         if not found and denied and self.auth_cfg.get("type") == "basic":
-            # Basic auth rejected everywhere: try common form logins,
-            # then re-probe with the obtained cookie/token.
-            if await self._try_form_logins():
+            # Auth rejected everywhere: try form logins (harvested paths
+            # first), then re-probe with the obtained cookie/token.
+            if await self._try_form_logins(login_candidates):
                 self._basic = None
-                for path in CANDIDATE_STATUS_PATHS:
+                for path in status_candidates:
                     _, data = await self._try_json(path)
                     if data is not None:
                         found.append({"name": _path_to_name(path), "path": path})
@@ -172,10 +238,10 @@ class KymetaCollector(Collector):
         except Exception:
             return None, None
 
-    async def _try_form_logins(self) -> bool:
+    async def _try_form_logins(self, login_paths=None) -> bool:
         username = self.auth_cfg.get("username", DEFAULT_USERNAME)
         password = self.auth_cfg.get("password", DEFAULT_PASSWORD)
-        for path in CANDIDATE_LOGIN_PATHS:
+        for path in login_paths or CANDIDATE_LOGIN_PATHS:
             try:
                 async with self._session.post(
                     self.base_url + path,
