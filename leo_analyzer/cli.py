@@ -10,11 +10,40 @@ Example:
 import argparse
 import asyncio
 import json
+import subprocess
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
 
-from .speedtest import run_speedtest
+
+def ensure_deps():
+    """Friendly first-run experience: offer to pip-install requirements."""
+    try:
+        import aiohttp  # noqa: F401
+
+        return
+    except ImportError:
+        pass
+    print("必要なライブラリ(aiohttp など)がまだインストールされていません。")
+    req = Path(__file__).resolve().parent.parent / "requirements.txt"
+    if sys.stdin.isatty():
+        try:
+            ans = input("今すぐ自動インストールしますか? [Y/n]: ").strip().lower()
+        except EOFError:
+            ans = "n"
+        if ans in ("", "y", "yes"):
+            if req.exists():
+                cmd = [sys.executable, "-m", "pip", "install", "-r", str(req)]
+            else:
+                cmd = [sys.executable, "-m", "pip", "install", "aiohttp", "PyYAML"]
+            print("実行中: " + " ".join(cmd))
+            if subprocess.call(cmd) == 0:
+                print("\nインストール完了。続行します。\n")
+                return
+            print("\nインストールに失敗しました。")
+    print("次のコマンドを実行してから再度お試しください:")
+    print("  python -m pip install -r requirements.txt")
+    sys.exit(1)
 
 
 def parse_duration(value, minimum: int = 1) -> int:
@@ -226,6 +255,8 @@ async def run(args):
                 sys.exit("error: --collect-only requires at least one --collect")
             await asyncio.sleep(args.duration)
         else:
+            from .speedtest import run_speedtest
+
             result = await run_speedtest(
                 rundir / "throughput.csv",
                 duration=args.duration,
@@ -304,6 +335,7 @@ def interactive_args():
 
 
 def main(argv=None):
+    ensure_deps()
     if argv is None and len(sys.argv) == 1 and sys.stdin.isatty():
         argv = interactive_args()
     args = build_parser().parse_args(argv)

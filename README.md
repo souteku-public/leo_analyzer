@@ -265,6 +265,7 @@ python -m leo_analyzer --kymeta-probe
 |---|---|
 | `python` が見つからない | Pythonインストール時に「Add python.exe to PATH」を入れ忘れた可能性。入れ直すのが早いです。Windowsでは `py -m leo_analyzer` も試してください |
 | `pip` が見つからない | `python -m pip install -r requirements.txt` を実行 |
+| `ModuleNotFoundError: No module named 'aiohttp'` | ライブラリ未インストール。ツールを起動すると自動インストールするか聞かれるので `Y` を入力(または `python -m pip install -r requirements.txt` を実行) |
 | 速度が明らかに低い | PCが衛星回線「経由」でネットに出ているか確認(社内LANやテザリング経由になっていないか)。PCのWi-Fiではなく有線接続推奨 |
 | Starlinkの情報が取れない | Starlink のLAN内から実行しているか確認。`192.168.100.1` にブラウザでアクセスできるかも確認 |
 | Kymetaの情報が取れない | `https://192.168.44.2` にブラウザでログインできるか確認。できる場合はWebGUIのHelpページ→APIタブでエンドポイントを確認し `config/kymeta.yaml` に記入 |
