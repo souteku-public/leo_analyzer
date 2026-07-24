@@ -31,16 +31,28 @@ auth:
   # token_prefix: "Bearer "
   # ※ Cookie セッションのみの場合は token_field を省略(Cookieは自動保持)
 
+# スペクトラム等の大きな配列データの取得間隔(秒)。
+# 実機のWebGUIに「スペクトラム表示中は性能が低下する可能性がある」との
+# 警告があるため既定は5秒。1 にすると毎秒、大きくすると負荷減
+array_interval: 5.0
+
 # 1秒ごとに取得する JSON エンドポイント。空にすると起動時に自動探索する。
 # 複数指定可(1行のCSVにマージ、列名は "<name>.<jsonキー>" になる)
 # 応答に大きな数値配列(スペクトラム・プロット履歴など)を含むものは
 # 自動判定され、全データは kymeta_<name>.jsonl へ、CSVには毎秒の
 # 要約(points/min/max/avg)だけが入る
+# 実機(ACU 2.6.6.62)のWebGUIが使っているエンドポイント名:
+#   status / modem / terminal / tracking-metrics(SINR) /
+#   point?select=RX(ビーム指向) / adc-data(スペクトラム)
+# URLの前置き(/ か /api/ 等)はファームによるため自動探索が判別します。
+# 明示指定する場合の例:
 endpoints: []
 #  - name: status
-#    path: "/api/status"
+#    path: "/status"
+#  - name: tracking_metrics
+#    path: "/tracking-metrics"
 #  - name: spectrum
-#    path: "/api/spectrum"
+#    path: "/adc-data"
 
 # WebSocket ストリーム(plots/spectrum ページがリアルタイム配信の場合)。
 # 空にすると WebGUI アプリから抽出したパスを自動試行する。

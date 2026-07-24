@@ -19,6 +19,7 @@ into one CSV row (keys prefixed with the endpoint name).
 import asyncio
 import json
 import re
+import time
 
 import aiohttp
 
@@ -29,9 +30,29 @@ DEFAULT_BASE_URL = "https://192.168.44.2"
 DEFAULT_USERNAME = "admin"
 DEFAULT_PASSWORD = "2Cfg^Ant"  # Kymeta factory-default admin password
 
+# Endpoint names observed in a real u8 WebGUI (ACU REV7, sw 2.6.6.62)
+# via DevTools: the SPA polls these while the Status/Plots/Spectrum pages
+# are open. The URL prefix is firmware-dependent, so each name is tried
+# under several bases.
+OBSERVED_ENDPOINT_NAMES = [
+    "status",            # full status page payload
+    "modem",
+    "terminal",
+    "tracking-metrics",  # SINR (Plots page)
+    "point?select=RX",   # beam pointing (Plots page)
+    "point?select=TX",
+    "time?gps=false",
+    "adc-data",          # spectrum bins (Spectrum page, large payload)
+]
+_PREFIX_BASES = ["/", "/api/", "/api/v1/", "/rest/"]
+
 # Probed in order when no endpoints are configured. Paths returning JSON
 # (dict/list) are adopted for 1 Hz polling.
 CANDIDATE_STATUS_PATHS = [
+    prefix + name
+    for name in OBSERVED_ENDPOINT_NAMES
+    for prefix in _PREFIX_BASES
+] + [
     "/api/status",
     "/api/v1/status",
     "/api/system/status",
@@ -150,6 +171,11 @@ class KymetaCollector(Collector):
         self.endpoints = list(config.get("endpoints") or [])
         self.stream_endpoints = list(config.get("stream_endpoints") or [])
         self.timeout = float(config.get("timeout", 5.0))
+        # spectrum/plot-history payloads are heavy and the u8 GUI warns
+        # that generating spectrum data can degrade system performance,
+        # so array endpoints are polled at a slower cadence by default
+        self.array_interval = float(config.get("array_interval", 5.0))
+        self._last_array_fetch = {}
         self._session = None
         self._headers = {}
         self._basic = None
@@ -465,6 +491,14 @@ class KymetaCollector(Collector):
         for ep in self.endpoints:
             name = ep["name"]
             try:
+                if ep.get("array"):
+                    now = time.time()
+                    if (
+                        now - self._last_array_fetch.get(name, 0.0)
+                        < self.array_interval
+                    ):
+                        continue  # heavy payload: throttled, columns stay blank
+                    self._last_array_fetch[name] = now
                 data = await self._fetch(ep["path"])
                 if ep.get("array"):
                     # plots/spectrum payload: full data to jsonl, summary
