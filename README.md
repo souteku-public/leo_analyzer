@@ -128,6 +128,7 @@ python -m leo_analyzer --label oneweb_intellian --duration 10m --direction down
 | `--outdir` | results | 出力先フォルダ |
 | `--collect` | なし | `starlink` / `kymeta`(繰り返し指定可) |
 | `--collect-only` | — | 速度測定なしでアンテナ情報だけ記録 |
+| `--report DIR` | — | 既存の測定フォルダからグラフレポートを再生成 |
 
 ## 6. 測定結果の見方
 
@@ -135,10 +136,28 @@ python -m leo_analyzer --label oneweb_intellian --duration 10m --direction down
 
 | ファイル | 内容 |
 |---|---|
+| `report.html` | **グラフレポート(ダブルクリックでブラウザ表示)** |
 | `throughput.csv` | 1秒ごとの下り/上り速度(Mbps)と応答時間(ms) |
 | `starlink_status.csv` | Starlinkアンテナの1秒ごとの状態(SNR、遮蔽率、衛星との通信品質など) |
 | `kymeta_status.csv` | Kymetaアンテナの1秒ごとの状態(CNR、ビーム方向、GPS位置など) |
 | `summary.json` | 平均・最大・最小などのまとめ |
+
+### グラフレポート(report.html)
+
+測定が終わると自動で `report.html` が生成されます。**ダブルクリックする
+だけでブラウザで開けます**(ネット接続不要・1ファイル完結)。内容:
+
+- 平均/最大速度・アイドルRTT・疎通不能秒数のサマリータイル
+- スループットの時系列グラフ(下り/上り、無負荷区間は網掛け表示)
+- 応答時間(RTT)の時系列グラフ(疎通が取れなかった秒は線が途切れる)
+- Starlink / Kymeta のアンテナ情報グラフ(変動している項目を自動選択)
+- グラフにマウスを乗せるとその秒の値がポップアップ表示されます
+
+過去の測定フォルダから作り直すこともできます:
+
+```bash
+python -m leo_analyzer --report results/20260724_090000_starlink
+```
 
 CSVはExcelでそのまま開けます。すべてのCSVに共通の時刻列
 (`timestamp_utc`=世界標準時、`epoch`=通し秒)があるので、速度と

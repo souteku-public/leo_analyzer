@@ -113,6 +113,12 @@ def build_parser():
         "found (with a ready-to-use YAML snippet) and exit",
     )
     p.add_argument(
+        "--report",
+        metavar="DIR",
+        help="regenerate report.html for an existing results directory "
+        "and exit (reports are also generated automatically after each run)",
+    )
+    p.add_argument(
         "--collect-only",
         action="store_true",
         help="log antenna telemetry without running the speed test "
@@ -181,6 +187,13 @@ async def kymeta_probe(args):
 
 
 async def run(args):
+    if args.report:
+        from .report import generate_report
+
+        out = generate_report(args.report)
+        print(f"report written: {out}")
+        return
+
     if args.kymeta_probe:
         await kymeta_probe(args)
         return
@@ -233,7 +246,15 @@ async def run(args):
 
     print("\n=== summary ===")
     print(json.dumps(summary, indent=2, ensure_ascii=False))
-    print(f"\nfiles written to {rundir}/")
+
+    try:
+        from .report import generate_report
+
+        report_path = generate_report(rundir)
+        print(f"\ngraph report: {report_path}  (ブラウザで開けます)")
+    except Exception as e:
+        print(f"\nreport generation failed: {e}")
+    print(f"files written to {rundir}/")
 
 
 def _ask(prompt: str, default: str) -> str:
