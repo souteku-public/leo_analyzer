@@ -16,6 +16,7 @@ Each endpoint is fetched every second, its JSON flattened and merged
 into one CSV row (keys prefixed with the endpoint name).
 """
 
+import asyncio
 import json
 import re
 
@@ -47,6 +48,17 @@ CANDIDATE_STATUS_PATHS = [
     "/api/diagnostics",
     "/api/satellite",
     "/api/beam",
+    # data sources behind the WebGUI's plots / spectrum pages
+    "/api/spectrum",
+    "/api/spectrum/data",
+    "/api/status/spectrum",
+    "/api/plots",
+    "/api/plot",
+    "/api/status/plots",
+    "/api/history",
+    "/api/metrics",
+    "/api/metrics/history",
+    "/api/telemetry/history",
     "/status.json",
     "/cgi-bin/status.json",
     "/data/status.json",
@@ -69,7 +81,20 @@ TOKEN_FIELDS = ["token", "access_token", "accessToken", "sessionId", "session_id
 _SCRIPT_SRC_RE = re.compile(r'<script[^>]+src=["\']([^"\']+)["\']', re.I)
 _API_PATH_RE = re.compile(r'["\'`](/?(?:api|rest)/[A-Za-z0-9_\-./]{2,80})["\'`]')
 _LOGIN_HINT_RE = re.compile(r"login|auth|session|token", re.I)
+_WS_PATH_RE = re.compile(
+    r'["\'`](wss?://[^"\'`\s]{4,120}'
+    r"|/[A-Za-z0-9_\-./]{0,60}(?:ws|websocket|socket|stream)"
+    r"[A-Za-z0-9_\-./]{0,60})[\"'`]",
+    re.I,
+)
+_STATIC_EXTS = (".js", ".css", ".png", ".svg", ".ico", ".map",
+                ".woff", ".woff2", ".html", ".json")
 _BUNDLE_MAX_BYTES = 8 * 1024 * 1024
+
+# a JSON response containing a numeric list at least this long is treated
+# as plot/spectrum data: full payload goes to a .jsonl file, and only a
+# per-second summary (points/min/max/avg) goes into the CSV
+ARRAY_MIN_LEN = 16
 
 
 def default_config() -> dict:
@@ -90,7 +115,28 @@ def _path_to_name(path: str) -> str:
     for prefix in ("api/", "cgi-bin/", "data/"):
         if name.startswith(prefix):
             name = name[len(prefix):]
-    return name.replace("/", "_").replace(".json", "") or "root"
+    name = re.sub(r"[^A-Za-z0-9_]+", "_", name.replace(".json", ""))
+    return name.strip("_") or "root"
+
+
+def _find_numeric_array(obj, min_len=ARRAY_MIN_LEN):
+    """Return the longest list of numbers found anywhere in the JSON."""
+    best = None
+    stack = [obj]
+    while stack:
+        cur = stack.pop()
+        if isinstance(cur, dict):
+            stack.extend(cur.values())
+        elif isinstance(cur, list):
+            if len(cur) >= min_len and all(
+                isinstance(v, (int, float)) and not isinstance(v, bool)
+                for v in cur
+            ):
+                if best is None or len(cur) > len(best):
+                    best = cur
+            else:
+                stack.extend(v for v in cur if isinstance(v, (dict, list)))
+    return best
 
 
 class KymetaCollector(Collector):
@@ -102,10 +148,14 @@ class KymetaCollector(Collector):
         self.verify_ssl = bool(config.get("verify_ssl", False))
         self.auth_cfg = config.get("auth", {}) or {}
         self.endpoints = list(config.get("endpoints") or [])
+        self.stream_endpoints = list(config.get("stream_endpoints") or [])
         self.timeout = float(config.get("timeout", 5.0))
         self._session = None
         self._headers = {}
         self._basic = None
+        self._jsonl_files = {}
+        self._ws_tasks = []
+        self._ws_stop = None
 
     async def setup(self):
         connector = aiohttp.TCPConnector(ssl=self.verify_ssl or False)
@@ -130,11 +180,27 @@ class KymetaCollector(Collector):
 
         if not self.endpoints:
             await self.discover()
+        else:
+            # explicit config: classify array endpoints on first fetch
+            for ep in self.endpoints:
+                if "array" not in ep:
+                    _, data = await self._try_json(ep["path"])
+                    ep["array"] = (
+                        data is not None
+                        and _find_numeric_array(data) is not None
+                    )
+
+        # websocket streams (plots/spectrum pages often push data live)
+        self._ws_stop = asyncio.Event()
+        for target in self.stream_endpoints[:4]:
+            self._ws_tasks.append(
+                asyncio.create_task(self._ws_reader(target))
+            )
 
     async def _harvest_app_paths(self):
         """Download the SPA's JS bundles and extract embedded API paths.
 
-        Returns (status_paths, login_paths), both deduped and ordered.
+        Returns (status_paths, login_paths, ws_paths), deduped and ordered.
         """
         texts = []
         try:
@@ -144,7 +210,7 @@ class KymetaCollector(Collector):
                 )
                 texts.append(html)
         except Exception:
-            return [], []
+            return [], [], []
         for src in _SCRIPT_SRC_RE.findall(html)[:12]:
             if src.startswith(("http://", "https://", "//")):
                 continue  # external script, not the antenna's own bundle
@@ -161,7 +227,7 @@ class KymetaCollector(Collector):
             except Exception:
                 continue
 
-        status_paths, login_paths = [], []
+        status_paths, login_paths, ws_paths = [], [], []
         seen = set()
         for text in texts:
             for match in _API_PATH_RE.findall(text):
@@ -173,15 +239,22 @@ class KymetaCollector(Collector):
                     login_paths.append(path)
                 else:
                     status_paths.append(path)
-        return status_paths[:60], login_paths[:10]
+            for match in _WS_PATH_RE.findall(text):
+                if match in seen or match.lower().endswith(_STATIC_EXTS):
+                    continue
+                if "{" in match or "*" in match:
+                    continue
+                seen.add(match)
+                ws_paths.append(match)
+        return status_paths[:60], login_paths[:10], ws_paths[:10]
 
     async def discover(self) -> list:
         """Probe candidate paths; adopt every one that returns JSON."""
-        app_status, app_logins = await self._harvest_app_paths()
-        if app_status or app_logins:
+        app_status, app_logins, app_ws = await self._harvest_app_paths()
+        if app_status or app_logins or app_ws:
             print(
-                f"[kymeta] found {len(app_status) + len(app_logins)} API path(s) "
-                "embedded in the WebGUI app"
+                f"[kymeta] found {len(app_status) + len(app_logins) + len(app_ws)} "
+                "API path(s) embedded in the WebGUI app"
             )
         # paths harvested from the actual app first, generic guesses after
         status_candidates = list(
@@ -193,7 +266,11 @@ class KymetaCollector(Collector):
         for path in status_candidates:
             status, data = await self._try_json(path)
             if data is not None:
-                found.append({"name": _path_to_name(path), "path": path})
+                found.append({
+                    "name": _path_to_name(path),
+                    "path": path,
+                    "array": _find_numeric_array(data) is not None,
+                })
             elif status in (401, 403):
                 denied += 1
 
@@ -205,18 +282,35 @@ class KymetaCollector(Collector):
                 for path in status_candidates:
                     _, data = await self._try_json(path)
                     if data is not None:
-                        found.append({"name": _path_to_name(path), "path": path})
+                        found.append({
+                            "name": _path_to_name(path),
+                            "path": path,
+                            "array": _find_numeric_array(data) is not None,
+                        })
 
-        if not found:
+        # adopt harvested websocket paths that actually accept a connection
+        if not self.stream_endpoints:
+            for target in app_ws[:6]:
+                if await self._ws_test(target):
+                    self.stream_endpoints.append(target)
+            if self.stream_endpoints:
+                print(
+                    "[kymeta] websocket stream(s): "
+                    + ", ".join(self.stream_endpoints)
+                )
+
+        if not found and not self.stream_endpoints:
             raise RuntimeError(
                 f"no JSON endpoints discovered on {self.base_url}; open the WebGUI "
                 "in a browser, check the JSON URLs in DevTools (F12) -> Network, "
                 "and list them in a config file (see config/kymeta.example.yaml)"
             )
         self.endpoints = found
+        arrays = [e["path"] for e in found if e.get("array")]
         print(
             f"[kymeta] discovered {len(found)} endpoint(s): "
             + ", ".join(e["path"] for e in found)
+            + (f"  (array data -> jsonl: {', '.join(arrays)})" if arrays else "")
         )
         return found
 
@@ -305,6 +399,18 @@ class KymetaCollector(Collector):
             name = ep["name"]
             try:
                 data = await self._fetch(ep["path"])
+                if ep.get("array"):
+                    # plots/spectrum payload: full data to jsonl, summary
+                    # scalars to the CSV
+                    self._jsonl_write(name, data)
+                    arr = _find_numeric_array(data)
+                    if arr:
+                        row[f"{name}.points"] = len(arr)
+                        row[f"{name}.min"] = round(min(arr), 3)
+                        row[f"{name}.max"] = round(max(arr), 3)
+                        row[f"{name}.avg"] = round(sum(arr) / len(arr), 3)
+                    row[f"{name}._error"] = ""
+                    continue
                 if not isinstance(data, (dict, list)):
                     data = {"raw": data}
                 if isinstance(data, list):
@@ -313,13 +419,108 @@ class KymetaCollector(Collector):
                 row[f"{name}._error"] = ""
             except Exception as e:
                 row[f"{name}._error"] = f"{type(e).__name__}: {e}"
+        if not self.endpoints:
+            return {"ws_streams": len(self._ws_tasks)}
         if all(row.get(f"{ep['name']}._error") for ep in self.endpoints):
             raise ConnectionError(
                 "; ".join(row[f"{ep['name']}._error"] for ep in self.endpoints)
             )
         return row
 
+    # --- extra data files (plots/spectrum arrays, websocket streams) ---
+
+    def _jsonl_write(self, name: str, payload):
+        from ..util import epoch_now, utc_now_iso
+
+        f = self._jsonl_files.get(name)
+        if f is None:
+            path = self.outdir / f"kymeta_{name}.jsonl"
+            f = open(path, "a", encoding="utf-8")
+            self._jsonl_files[name] = f
+        f.write(
+            json.dumps(
+                {
+                    "timestamp_utc": utc_now_iso(),
+                    "epoch": round(epoch_now(), 3),
+                    "data": payload,
+                },
+                ensure_ascii=False,
+            )
+            + "\n"
+        )
+        f.flush()
+
+    def _ws_url(self, target: str) -> str:
+        if target.startswith(("ws://", "wss://")):
+            return target
+        scheme = "wss" if self.base_url.startswith("https") else "ws"
+        host = self.base_url.split("://", 1)[1]
+        return f"{scheme}://{host}/{target.lstrip('/')}"
+
+    async def _ws_test(self, target: str) -> bool:
+        try:
+            ws = await asyncio.wait_for(
+                self._session.ws_connect(
+                    self._ws_url(target), headers=self._headers
+                ),
+                timeout=4,
+            )
+        except Exception:
+            return False
+        try:
+            # a streaming server may not ack the close promptly; don't let
+            # the handshake stall discovery
+            await asyncio.wait_for(ws.close(), timeout=1.5)
+        except Exception:
+            pass
+        return True
+
+    async def _ws_reader(self, target: str):
+        """Log every websocket message to its own jsonl; auto-reconnect."""
+        name = "ws_" + _path_to_name(target.split("://")[-1].split("/", 1)[-1])
+        while not self._ws_stop.is_set():
+            try:
+                ws = await self._session.ws_connect(
+                    self._ws_url(target), headers=self._headers, timeout=6
+                )
+                print(f"[kymeta] websocket connected: {target}")
+                async for msg in ws:
+                    if msg.type == aiohttp.WSMsgType.TEXT:
+                        try:
+                            payload = json.loads(msg.data)
+                        except ValueError:
+                            payload = msg.data
+                        self._jsonl_write(name, payload)
+                    elif msg.type == aiohttp.WSMsgType.BINARY:
+                        self._jsonl_write(
+                            name, {"binary_bytes": len(msg.data)}
+                        )
+                    if self._ws_stop.is_set():
+                        await ws.close()
+                        return
+            except asyncio.CancelledError:
+                return
+            except Exception:
+                pass
+            try:
+                await asyncio.wait_for(self._ws_stop.wait(), timeout=5)
+            except asyncio.TimeoutError:
+                continue
+
     async def teardown(self):
+        if self._ws_stop is not None:
+            self._ws_stop.set()
+        for t in self._ws_tasks:
+            t.cancel()
+        if self._ws_tasks:
+            await asyncio.gather(*self._ws_tasks, return_exceptions=True)
+        self._ws_tasks = []
+        for f in self._jsonl_files.values():
+            try:
+                f.close()
+            except Exception:
+                pass
+        self._jsonl_files = {}
         if self._session:
             await self._session.close()
             self._session = None

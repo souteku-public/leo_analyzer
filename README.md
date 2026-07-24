@@ -140,6 +140,8 @@ python -m leo_analyzer --label oneweb_intellian --duration 10m --direction down
 | `throughput.csv` | 1秒ごとの下り/上り速度(Mbps)と応答時間(ms) |
 | `starlink_status.csv` | Starlinkアンテナの1秒ごとの状態(SNR、遮蔽率、衛星との通信品質など) |
 | `kymeta_status.csv` | Kymetaアンテナの1秒ごとの状態(CNR、ビーム方向、GPS位置など) |
+| `kymeta_<名前>.jsonl` | スペクトラム・プロット等の配列データ(毎秒の全データ) |
+| `kymeta_ws_<名前>.jsonl` | WebSocketストリームの全受信メッセージ |
 | `summary.json` | 平均・最大・最小などのまとめ |
 
 ### グラフレポート(report.html)
@@ -230,6 +232,17 @@ KymetaのWebGUIは画面(`/#/status` など)とデータ取得APIが分離した
 SPA構成のため、探索時はWebGUIアプリ本体(JS)をダウンロードして
 埋め込まれたAPIパスを抽出し、一般的な候補パスと合わせて試します。
 ログインもフォーム式/Basic認証の両方を自動試行します。
+
+**plots / spectrum ページの数値データ**も取得対象です:
+
+- 応答に大きな数値配列(スペクトラム、プロット履歴など)を含む
+  エンドポイントは自動判別され、**全データが `kymeta_<名前>.jsonl` に
+  毎秒完全保存**されます。CSV側にはその秒の要約
+  (`<名前>.points / .min / .max / .avg`)が入ります
+- WebGUIがWebSocketでリアルタイム配信している場合は自動で接続し、
+  受信した全メッセージを `kymeta_ws_<名前>.jsonl` に記録します
+  (切断時は自動再接続)。接続先はWebGUIアプリから自動抽出するほか、
+  `config/kymeta.yaml` の `stream_endpoints` で明示指定もできます
 
 事前に何が取れるか確認したいときは:
 

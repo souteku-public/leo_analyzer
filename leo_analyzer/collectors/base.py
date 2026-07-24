@@ -2,12 +2,14 @@
 
 import asyncio
 import time
+from pathlib import Path
 
 from ..util import CsvLogger, epoch_now, utc_now_iso
 
 
 class Collector:
     name = "collector"
+    outdir = Path(".")  # set by run() before setup(); extra output files go here
 
     async def sample(self) -> dict:
         """Return one flat dict of telemetry values. Raise on failure."""
@@ -21,6 +23,7 @@ class Collector:
 
     async def run(self, csv_path, stop: asyncio.Event, interval: float = 1.0):
         logger = CsvLogger(csv_path)
+        self.outdir = Path(csv_path).parent
         pending = []  # error rows seen before the column set is known
         header_ready = False
         errors = 0

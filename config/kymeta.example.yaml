@@ -33,6 +33,18 @@ auth:
 
 # 1秒ごとに取得する JSON エンドポイント。空にすると起動時に自動探索する。
 # 複数指定可(1行のCSVにマージ、列名は "<name>.<jsonキー>" になる)
+# 応答に大きな数値配列(スペクトラム・プロット履歴など)を含むものは
+# 自動判定され、全データは kymeta_<name>.jsonl へ、CSVには毎秒の
+# 要約(points/min/max/avg)だけが入る
 endpoints: []
 #  - name: status
 #    path: "/api/status"
+#  - name: spectrum
+#    path: "/api/spectrum"
+
+# WebSocket ストリーム(plots/spectrum ページがリアルタイム配信の場合)。
+# 空にすると WebGUI アプリから抽出したパスを自動試行する。
+# 受信メッセージは kymeta_ws_<name>.jsonl に全件記録される
+stream_endpoints: []
+#  - "/ws/spectrum"
+#  - "wss://192.168.44.2/stream/plots"
