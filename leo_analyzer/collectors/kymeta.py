@@ -91,6 +91,9 @@ CANDIDATE_LOGIN_PATHS = [
     "/api/session",
     "/api/auth/login",
     "/login",
+    "/sessions",
+    "/auth",
+    "/users/login",
 ]
 
 TOKEN_FIELDS = ["token", "access_token", "accessToken", "sessionId", "session_id"]
@@ -110,6 +113,16 @@ _WS_PATH_RE = re.compile(
 )
 _STATIC_EXTS = (".js", ".css", ".png", ".svg", ".ico", ".map",
                 ".woff", ".woff2", ".html", ".json")
+# first string argument of fetch()/.get()/.post()/axios() calls in the
+# bundle — catches endpoints that have no /api prefix at all
+_FETCH_ARG_RE = re.compile(
+    r'(?:fetch|axios(?:\.\w+)?|\.get|\.post|\.put)\s*\(\s*'
+    r'["\']([A-Za-z0-9_\-./?=&]{2,80})["\']'
+)
+# absolute URLs (the GUI may call an API on another port of the antenna)
+_ABS_URL_RE = re.compile(
+    r'["\'](https?://[A-Za-z0-9_\-.:]+/[A-Za-z0-9_\-./?=&]{0,80})["\']'
+)
 _BUNDLE_MAX_BYTES = 8 * 1024 * 1024
 
 # a JSON response containing a numeric list at least this long is treated
@@ -132,6 +145,8 @@ def default_config() -> dict:
 
 
 def _path_to_name(path: str) -> str:
+    if path.startswith(("http://", "https://")):
+        path = "/" + path.split("://", 1)[-1].split("/", 1)[-1]
     name = path.strip("/")
     for prefix in ("api/", "cgi-bin/", "data/"):
         if name.startswith(prefix):
@@ -266,16 +281,27 @@ class KymetaCollector(Collector):
 
         status_paths, login_paths, ws_paths = [], [], []
         seen = set()
+        host = self.base_url.split("://", 1)[-1].split("/", 1)[0].split(":")[0]
+
+        def add(path):
+            if "{" in path or path in seen or path.lower().endswith(_STATIC_EXTS):
+                return
+            seen.add(path)
+            if _LOGIN_HINT_RE.search(path):
+                login_paths.append(path)
+            else:
+                status_paths.append(path)
+
         for text in texts:
             for match in _API_PATH_RE.findall(text):
-                path = "/" + match.lstrip("/")
-                if "{" in path or path in seen:
-                    continue
-                seen.add(path)
-                if _LOGIN_HINT_RE.search(path):
-                    login_paths.append(path)
-                else:
-                    status_paths.append(path)
+                add("/" + match.lstrip("/"))
+            # generic HTTP-call arguments (endpoints without /api prefix)
+            for match in _FETCH_ARG_RE.findall(text)[:40]:
+                add("/" + match.lstrip("./"))
+            # absolute URLs on the antenna itself (possibly another port)
+            for match in _ABS_URL_RE.findall(text):
+                if host in match:
+                    add(match)
             for match in _WS_PATH_RE.findall(text):
                 if match in seen or match.lower().endswith(_STATIC_EXTS):
                     continue
@@ -310,6 +336,33 @@ class KymetaCollector(Collector):
                 )
         return False
 
+    async def _probe_paths(self, paths, note=""):
+        found = []
+        for path in paths:
+            status, data = await self._try_json(path)
+            if data is not None:
+                self.probe_log.append(f"{path}: JSON 取得成功{note}")
+                found.append({
+                    "name": _path_to_name(path),
+                    "path": path,
+                    "array": _find_numeric_array(data) is not None,
+                })
+            elif status in (401, 403):
+                self.probe_log.append(f"{path}: HTTP {status} (認証拒否){note}")
+            elif status == 200:
+                self.probe_log.append(
+                    f"{path}: HTTP 200 (JSONでない/画面のHTML){note}"
+                )
+            elif status == 503:
+                self.probe_log.append(
+                    f"{path}: HTTP 503 (パスは存在するが一時的に利用不可){note}"
+                )
+            elif status is None:
+                self.probe_log.append(f"{path}: 接続エラー{note}")
+            else:
+                self.probe_log.append(f"{path}: HTTP {status}{note}")
+        return found
+
     async def discover(self) -> list:
         """Probe candidate paths; adopt every one that returns JSON."""
         if not await self._ensure_reachable():
@@ -332,42 +385,17 @@ class KymetaCollector(Collector):
         )
         login_candidates = list(dict.fromkeys(app_logins + CANDIDATE_LOGIN_PATHS))
 
-        found, denied = [], 0
-        for path in status_candidates:
-            status, data = await self._try_json(path)
-            if data is not None:
-                self.probe_log.append(f"{path}: JSON 取得成功")
-                found.append({
-                    "name": _path_to_name(path),
-                    "path": path,
-                    "array": _find_numeric_array(data) is not None,
-                })
-            elif status in (401, 403):
-                denied += 1
-                self.probe_log.append(f"{path}: HTTP {status} (認証拒否)")
-            elif status == 200:
-                self.probe_log.append(f"{path}: HTTP 200 (JSONでない/画面のHTML)")
-            elif status is None:
-                self.probe_log.append(f"{path}: 接続エラー")
-            else:
-                self.probe_log.append(f"{path}: HTTP {status}")
+        found = await self._probe_paths(status_candidates, note="")
 
-        if not found and denied and self.auth_cfg.get("type") == "basic":
-            # Auth rejected everywhere: try form logins (harvested paths
-            # first), then re-probe with the obtained cookie/token.
+        if not found and self.auth_cfg.get("type") == "basic":
+            # Nothing found yet. Some firmwares hide endpoints behind a
+            # session and answer 404 (not 401) when unauthenticated, so
+            # always attempt a form login before giving up.
             if await self._try_form_logins(login_candidates):
                 self._basic = None
-                for path in status_candidates:
-                    _, data = await self._try_json(path)
-                    if data is not None:
-                        self.probe_log.append(
-                            f"{path}: JSON 取得成功(フォームログイン後)"
-                        )
-                        found.append({
-                            "name": _path_to_name(path),
-                            "path": path,
-                            "array": _find_numeric_array(data) is not None,
-                        })
+                found = await self._probe_paths(
+                    status_candidates, note="(フォームログイン後)"
+                )
             else:
                 self.probe_log.append(
                     "フォームログイン: 全候補パスで失敗 "
@@ -407,11 +435,16 @@ class KymetaCollector(Collector):
         )
         return found
 
+    def _url(self, path: str) -> str:
+        return path if path.startswith(("http://", "https://")) else self.base_url + path
+
     async def _try_json(self, path: str):
         """Return (status, parsed_json_or_None); never raises."""
         try:
             async with self._session.get(
-                self.base_url + path, headers=self._headers, auth=self._basic
+                self._url(path),
+                headers={"Accept": "application/json", **self._headers},
+                auth=self._basic,
             ) as resp:
                 if resp.status != 200:
                     return resp.status, None
@@ -428,27 +461,39 @@ class KymetaCollector(Collector):
     async def _try_form_logins(self, login_paths=None) -> bool:
         username = self.auth_cfg.get("username", DEFAULT_USERNAME)
         password = self.auth_cfg.get("password", DEFAULT_PASSWORD)
+        creds = {"username": username, "password": password}
         for path in login_paths or CANDIDATE_LOGIN_PATHS:
-            try:
-                async with self._session.post(
-                    self.base_url + path,
-                    json={"username": username, "password": password},
-                ) as resp:
-                    if resp.status != 200:
-                        continue
-                    try:
-                        body = await resp.json(content_type=None)
-                    except Exception:
-                        body = {}
-                    if isinstance(body, dict):
-                        for field in TOKEN_FIELDS:
-                            if body.get(field):
-                                self._headers["Authorization"] = f"Bearer {body[field]}"
-                                break
-                    print(f"[kymeta] form login succeeded at {path}")
-                    return True  # cookie jar and/or bearer token now set
-            except Exception:
-                continue
+            for kwargs in ({"json": creds}, {"data": creds}):
+                try:
+                    async with self._session.post(
+                        self._url(path), **kwargs
+                    ) as resp:
+                        if resp.status not in (200, 201):
+                            self.probe_log.append(
+                                f"POST {path}: HTTP {resp.status}"
+                            )
+                            if resp.status in (400, 415, 422):
+                                continue  # retry with the other encoding
+                            break  # 404 etc.: other encoding won't differ
+                        try:
+                            body = await resp.json(content_type=None)
+                        except Exception:
+                            body = {}
+                        if isinstance(body, dict):
+                            for field in TOKEN_FIELDS:
+                                if body.get(field):
+                                    self._headers["Authorization"] = (
+                                        f"Bearer {body[field]}"
+                                    )
+                                    break
+                        self.probe_log.append(f"POST {path}: ログイン成功")
+                        print(f"[kymeta] form login succeeded at {path}")
+                        return True  # cookie jar / bearer token now set
+                except Exception as e:
+                    self.probe_log.append(
+                        f"POST {path}: 接続エラー ({type(e).__name__})"
+                    )
+                    break
         return False
 
     async def _login(self):
@@ -474,9 +519,11 @@ class KymetaCollector(Collector):
             self._headers[header] = f"{prefix}{token}"
 
     async def _fetch(self, path: str):
-        url = self.base_url + path
+        url = self._url(path)
         async with self._session.get(
-            url, headers=self._headers, auth=self._basic
+            url,
+            headers={"Accept": "application/json", **self._headers},
+            auth=self._basic,
         ) as resp:
             if resp.status == 401 and self.auth_cfg.get("type") == "form":
                 await self._login()
