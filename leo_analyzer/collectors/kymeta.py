@@ -213,6 +213,8 @@ class KymetaCollector(Collector):
         self._ws_tasks = []
         self._ws_stop = None
         self.probe_log = []  # human-readable trail of what discovery tried
+        self._login_ok_path = None  # form-login endpoint that worked
+        self._last_relogin = 0.0
 
     async def setup(self):
         connector = aiohttp.TCPConnector(ssl=self.verify_ssl or False)
@@ -519,6 +521,7 @@ class KymetaCollector(Collector):
                                     break
                         self.probe_log.append(f"POST {path}: ログイン成功")
                         print(f"[kymeta] form login succeeded at {path}")
+                        self._login_ok_path = path
                         return True  # cookie jar / bearer token now set
                 except Exception as e:
                     self.probe_log.append(
@@ -603,10 +606,28 @@ class KymetaCollector(Collector):
         if not self.endpoints:
             return {"ws_streams": len(self._ws_tasks)}
         if all(row.get(f"{ep['name']}._error") for ep in self.endpoints):
+            # every endpoint failed this second — if a session/login was
+            # in use it may have expired, so re-authenticate (throttled)
+            await self._maybe_relogin()
             raise ConnectionError(
                 "; ".join(row[f"{ep['name']}._error"] for ep in self.endpoints)
             )
         return row
+
+    async def _maybe_relogin(self):
+        now = time.time()
+        if now - self._last_relogin < 15:
+            return
+        self._last_relogin = now
+        try:
+            if self.auth_cfg.get("type") == "form":
+                await self._login()
+                print("[kymeta] session re-established (form login)")
+            elif self._login_ok_path:
+                if await self._try_form_logins([self._login_ok_path]):
+                    print("[kymeta] session re-established")
+        except Exception:
+            pass
 
     # --- extra data files (plots/spectrum arrays, websocket streams) ---
 
