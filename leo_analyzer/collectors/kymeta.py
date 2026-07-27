@@ -205,7 +205,14 @@ class KymetaCollector(Collector):
         # that generating spectrum data can degrade system performance,
         # so array endpoints are polled at a slower cadence by default
         self.array_interval = float(config.get("array_interval", 5.0))
+        # array payloads are written gzip-compressed (~10x smaller) and
+        # stop being written when the disk gets low
+        self.array_gzip = bool(config.get("array_gzip", True))
+        self.min_free_mb = float(config.get("min_free_mb", 1024))
+        self.compact = bool(config.get("compact", True))
         self._last_array_fetch = {}
+        self._disk_full = False
+        self._last_disk_check = 0.0
         self._session = None
         self._headers = {}
         self._basic = None
@@ -581,6 +588,8 @@ class KymetaCollector(Collector):
                         < self.array_interval
                     ):
                         continue  # heavy payload: throttled, columns stay blank
+                    if not self._disk_ok():
+                        continue
                     self._last_array_fetch[name] = now
                 data = await self._fetch(ep["path"])
                 if ep.get("array"):
@@ -631,13 +640,44 @@ class KymetaCollector(Collector):
 
     # --- extra data files (plots/spectrum arrays, websocket streams) ---
 
+    def _disk_ok(self) -> bool:
+        """Stop writing bulk data before the disk fills up."""
+        now = time.time()
+        if now - self._last_disk_check < 30:
+            return not self._disk_full
+        self._last_disk_check = now
+        try:
+            import shutil
+
+            free_mb = shutil.disk_usage(self.outdir).free / (1024 * 1024)
+        except Exception:
+            return True
+        if free_mb < self.min_free_mb:
+            if not self._disk_full:
+                print(
+                    f"[kymeta] 空きディスクが {free_mb:.0f}MB を切ったため"
+                    "スペクトラム等の大容量データの記録を停止します"
+                    "(CSVの記録は継続)"
+                )
+            self._disk_full = True
+        elif self._disk_full and free_mb > self.min_free_mb * 1.5:
+            print("[kymeta] 空き容量が回復したため大容量データの記録を再開します")
+            self._disk_full = False
+        return not self._disk_full
+
     def _jsonl_write(self, name: str, payload):
         from ..util import epoch_now, utc_now_iso
 
         f = self._jsonl_files.get(name)
         if f is None:
-            path = self.outdir / f"kymeta_{name}.jsonl"
-            f = open(path, "a", encoding="utf-8")
+            if self.array_gzip:
+                import gzip
+
+                path = self.outdir / f"kymeta_{name}.jsonl.gz"
+                f = gzip.open(path, "at", encoding="utf-8")
+            else:
+                path = self.outdir / f"kymeta_{name}.jsonl"
+                f = open(path, "a", encoding="utf-8")
             self._jsonl_files[name] = f
         f.write(
             json.dumps(

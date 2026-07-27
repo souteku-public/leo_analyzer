@@ -367,7 +367,7 @@ def _phases_from_rows(rows, t0):
 
 def _pick_columns(rows, max_cols=8):
     """Numeric columns that actually vary, most-varying first (relative)."""
-    skip = {"timestamp_utc", "epoch", "error"}
+    skip = {"timestamp_utc", "epoch", "error", "notes"}
     scores = []
     for col in rows[0].keys():
         if col in skip or col.endswith("._error"):

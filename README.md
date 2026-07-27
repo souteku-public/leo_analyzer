@@ -129,6 +129,39 @@ python -m leo_analyzer --label oneweb_intellian --duration 10m --direction down
 | `--collect` | なし | `starlink` / `kymeta`(繰り返し指定可) |
 | `--collect-only` | — | 速度測定なしでアンテナ情報だけ記録 |
 | `--report DIR` | — | 既存の測定フォルダからグラフレポートを再生成 |
+| `--kymeta-array-interval` | 5 | スペクトラム取得の間隔(秒)。長時間測定では大きく |
+| `--keep-all-columns` | — | CSVを圧縮せず全項目を記録する |
+
+### 長時間測定とディスク容量
+
+CSVは自動で圧縮されます。測定開始から約90秒間の観測で、**一度も値が
+返らない項目は列ごと省略**し、**ずっと同じ値の項目は
+`kymeta_status_static.json` に1回だけ記録**してCSVから外します
+(実測で127列→十数列)。情報は失われず、後から固定値が変化した場合は
+`notes` 列に、一部エンドポイントの失敗は `error` 列に記録されます。
+全項目を残したい場合は `--keep-all-columns` を付けてください。
+
+24時間などの長時間測定では、容量の主因は**スペクトラム(`adc-data`、
+1回約175KB)** です。gzip圧縮して保存しますが、それでも既定の5秒間隔
+だと24時間で数GBになります。長時間測定では間隔を広げてください:
+
+```bash
+# 24時間、スペクトラムは1分ごと(容量を約1/12に)
+python -m leo_analyzer --label oneweb_24h --duration 12h \
+    --collect kymeta --kymeta-array-interval 60
+```
+
+目安(24時間・gzip後):
+
+| スペクトラム間隔 | 概算容量 |
+|---|---|
+| 5秒(既定) | 約 3 GB |
+| 30秒 | 約 500 MB |
+| 60秒 | 約 250 MB |
+| 取得しない(`--kymeta-array-interval 999999`) | 0 |
+
+CSV(圧縮後)は24時間でも数十MB程度です。空きディスクが1GBを切ると
+スペクトラムの記録を自動停止し(CSVは継続)、回復すると再開します。
 
 ## 6. 測定結果の見方
 
@@ -140,7 +173,8 @@ python -m leo_analyzer --label oneweb_intellian --duration 10m --direction down
 | `throughput.csv` | 1秒ごとの下り/上り速度(Mbps)と応答時間(ms) |
 | `starlink_status.csv` | Starlinkアンテナの1秒ごとの状態(SNR、遮蔽率、衛星との通信品質など) |
 | `kymeta_status.csv` | Kymetaアンテナの1秒ごとの状態(CNR、ビーム方向、GPS位置など) |
-| `kymeta_<名前>.jsonl` | スペクトラム・プロット等の配列データ(毎秒の全データ) |
+| `kymeta_<名前>.jsonl.gz` | スペクトラム等の配列データ(全データ・gzip圧縮) |
+| `kymeta_status_static.json` | 測定中ずっと同じ値だった項目(CSVから省いた分) |
 | `kymeta_ws_<名前>.jsonl` | WebSocketストリームの全受信メッセージ |
 | `summary.json` | 平均・最大・最小などのまとめ |
 

@@ -136,6 +136,19 @@ def build_parser():
         "login and endpoint auto-discovery — see config/kymeta.example.yaml)",
     )
     p.add_argument(
+        "--kymeta-array-interval",
+        type=float,
+        metavar="SEC",
+        help="seconds between spectrum (adc-data) fetches; larger values "
+        "save a lot of disk on long runs (default: 5)",
+    )
+    p.add_argument(
+        "--keep-all-columns",
+        action="store_true",
+        help="write every telemetry field to the CSV, including fields "
+        "that never change or are never populated (default: compacted)",
+    )
+    p.add_argument(
         "--kymeta-probe",
         action="store_true",
         help="probe the Kymeta antenna for JSON endpoints, print what was "
@@ -167,21 +180,27 @@ def make_collectors(args):
                     "error: --collect starlink requires grpcio/protobuf/yagrc "
                     f"(pip install -r requirements.txt): {e}"
                 )
-            collectors.append(StarlinkCollector(addr=args.starlink_addr))
+            c = StarlinkCollector(addr=args.starlink_addr)
+            c.compact = not args.keep_all_columns
+            collectors.append(c)
         elif name == "kymeta":
             collectors.append(make_kymeta_collector(args))
     return collectors
 
 
 def make_kymeta_collector(args):
-    from .collectors.kymeta import KymetaCollector
+    from .collectors.kymeta import KymetaCollector, default_config
 
-    cfg = None  # None -> built-in defaults (192.168.44.2, admin, discovery)
+    cfg = default_config()  # 192.168.44.2, admin, auto-discovery
     if args.kymeta_config:
         import yaml
 
         with open(args.kymeta_config, encoding="utf-8") as f:
             cfg = yaml.safe_load(f)
+    if args.kymeta_array_interval is not None:
+        cfg["array_interval"] = args.kymeta_array_interval
+    if args.keep_all_columns:
+        cfg["compact"] = False
     return KymetaCollector(cfg)
 
 
