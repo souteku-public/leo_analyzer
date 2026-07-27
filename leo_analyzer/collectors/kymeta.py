@@ -209,10 +209,14 @@ class KymetaCollector(Collector):
         # stop being written when the disk gets low
         self.array_gzip = bool(config.get("array_gzip", True))
         self.min_free_mb = float(config.get("min_free_mb", 1024))
+        # hard ceiling on bulk (array/websocket) data for one run
+        self.max_bulk_mb = float(config.get("max_bulk_mb", 2048))
         self.compact = bool(config.get("compact", True))
         self._last_array_fetch = {}
         self._disk_full = False
         self._last_disk_check = 0.0
+        self._bulk_bytes = 0
+        self._bulk_capped = False
         self._session = None
         self._headers = {}
         self._basic = None
@@ -588,7 +592,7 @@ class KymetaCollector(Collector):
                         < self.array_interval
                     ):
                         continue  # heavy payload: throttled, columns stay blank
-                    if not self._disk_ok():
+                    if self._bulk_capped or not self._disk_ok():
                         continue
                     self._last_array_fetch[name] = now
                 data = await self._fetch(ep["path"])
@@ -679,18 +683,28 @@ class KymetaCollector(Collector):
                 path = self.outdir / f"kymeta_{name}.jsonl"
                 f = open(path, "a", encoding="utf-8")
             self._jsonl_files[name] = f
-        f.write(
-            json.dumps(
-                {
-                    "timestamp_utc": utc_now_iso(),
-                    "epoch": round(epoch_now(), 3),
-                    "data": payload,
-                },
-                ensure_ascii=False,
-            )
-            + "\n"
+        line = json.dumps(
+            {
+                "timestamp_utc": utc_now_iso(),
+                "epoch": round(epoch_now(), 3),
+                "data": payload,
+            },
+            ensure_ascii=False,
         )
+        f.write(line + "\n")
         f.flush()
+        self._bulk_bytes += len(line)
+        if (
+            not self._bulk_capped
+            and self._bulk_bytes > self.max_bulk_mb * 1024 * 1024
+        ):
+            self._bulk_capped = True
+            print(
+                f"[kymeta] 大容量データが上限 {self.max_bulk_mb:.0f}MB "
+                "に達したため記録を停止します(CSVの記録は継続)。"
+                "続けたい場合は --kymeta-array-interval を大きくするか "
+                "config の max_bulk_mb を変更してください"
+            )
 
     def _ws_url(self, target: str) -> str:
         if target.startswith(("ws://", "wss://")):
@@ -737,6 +751,9 @@ class KymetaCollector(Collector):
                         self._jsonl_write(
                             name, {"binary_bytes": len(msg.data)}
                         )
+                    if self._bulk_capped or self._disk_full:
+                        await ws.close()
+                        return
                     if self._ws_stop.is_set():
                         await ws.close()
                         return

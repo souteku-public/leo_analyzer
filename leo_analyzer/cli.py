@@ -161,6 +161,13 @@ def build_parser():
         "and exit (reports are also generated automatically after each run)",
     )
     p.add_argument(
+        "--compare",
+        nargs="+",
+        metavar="DIR",
+        help="build compare.html overlaying the common metrics of several "
+        "runs (e.g. Starlink vs Kymeta) on one time axis, then exit",
+    )
+    p.add_argument(
         "--collect-only",
         action="store_true",
         help="log antenna telemetry without running the speed test "
@@ -255,6 +262,13 @@ async def kymeta_probe(args):
 
 
 async def run(args):
+    if args.compare:
+        from .report import generate_compare_report
+
+        out = generate_compare_report(args.compare)
+        print(f"comparison report written: {out}")
+        return
+
     if args.report:
         from .report import generate_report
 
@@ -311,8 +325,18 @@ async def run(args):
         if collector_tasks:
             await asyncio.gather(*collector_tasks, return_exceptions=True)
         summary["finished_utc"] = datetime.now(timezone.utc).isoformat()
+        files = sorted(
+            ((p.name, p.stat().st_size) for p in rundir.iterdir() if p.is_file()),
+            key=lambda kv: -kv[1],
+        )
+        summary["output_files"] = {n: f"{s / 1e6:.1f} MB" for n, s in files}
         with open(rundir / "summary.json", "w", encoding="utf-8") as f:
             json.dump(summary, f, indent=2, ensure_ascii=False)
+        total = sum(s for _, s in files)
+        if total > 200e6:
+            print(f"\n出力ファイル合計 {total / 1e9:.2f} GB:")
+            for n, s in files[:5]:
+                print(f"  {s / 1e6:9.1f} MB  {n}")
 
     print("\n=== summary ===")
     print(json.dumps(summary, indent=2, ensure_ascii=False))

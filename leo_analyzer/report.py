@@ -19,7 +19,8 @@ CSS = """
   --surface: #fcfcfb; --page: #f9f9f7;
   --ink: #0b0b0b; --ink-2: #52514e; --muted: #898781;
   --grid: #e1e0d9; --axis: #c3c2b7; --border: rgba(11,11,11,0.10);
-  --s1: #2a78d6; --s2: #eb6834; --crit: #d03b3b;
+  --s1: #2a78d6; --s2: #eb6834; --s3: #1baf7a; --s4: #eda100;
+  --s5: #e87ba4; --s6: #008300; --crit: #d03b3b;
   --band: rgba(137,135,129,0.10);
 }
 @media (prefers-color-scheme: dark) {
@@ -27,7 +28,8 @@ CSS = """
     --surface: #1a1a19; --page: #0d0d0d;
     --ink: #ffffff; --ink-2: #c3c2b7; --muted: #898781;
     --grid: #2c2c2a; --axis: #383835; --border: rgba(255,255,255,0.10);
-    --s1: #3987e5; --s2: #d95926; --crit: #d03b3b;
+    --s1: #3987e5; --s2: #d95926; --s3: #199e70; --s4: #c98500;
+    --s5: #d55181; --s6: #008300; --crit: #d03b3b;
     --band: rgba(137,135,129,0.14);
   }
 }
@@ -130,6 +132,9 @@ JS = """
 W, H = 900, 260
 ML, MR, MT, MB = 58, 16, 14, 30  # margins
 PHASE_LABELS = {"baseline": "無負荷", "download": "下り測定", "upload": "上り測定"}
+# categorical slots (validated order); index k -> CSS var / literal hex
+PALETTE_VARS = [f"var(--s{i})" for i in range(1, 7)]
+PALETTE_HEX = ["#2a78d6", "#eb6834", "#1baf7a", "#eda100", "#e87ba4", "#008300"]
 
 
 def _fmt_elapsed(sec):
@@ -196,11 +201,12 @@ def _downsample(ts, values_list, max_points=1400):
 
 
 def svg_chart(title, caption, ts, series, unit, phases=None, colors=None,
-              w=W, h=H):
+              w=W, h=H, time_fmt=None):
     """series: list of (name, [float|None,...]); ts: elapsed seconds."""
     if not ts:
         return ""
-    colors = colors or ["var(--s1)", "var(--s2)"]
+    fmt = time_fmt or _fmt_elapsed
+    colors = colors or PALETTE_VARS
     ts, vals = _downsample(ts, [v for _, v in series])
     series = [(series[i][0], vals[i]) for i in range(len(series))]
 
@@ -261,7 +267,7 @@ def svg_chart(title, caption, ts, series, unit, phases=None, colors=None,
         parts.append(
             f'<text x="{xx:.1f}" y="{y1 + 17}" font-size="11" fill="var(--muted)" '
             f'text-anchor="middle" '
-            f'style="font-variant-numeric:tabular-nums">{_fmt_elapsed(tt)}</text>'
+            f'style="font-variant-numeric:tabular-nums">{fmt(tt)}</text>'
         )
         tt += step
     # baseline axis
@@ -300,11 +306,11 @@ def svg_chart(title, caption, ts, series, unit, phases=None, colors=None,
     data = {
         "x0": x0, "x1": x1, "y0": y0, "y1": y1,
         "vmin": 0, "vmax": vmax, "unit": unit,
-        "t": [_fmt_elapsed(t) for t in ts],
+        "t": [fmt(t) for t in ts],
         "series": [
             {
                 "n": name,
-                "c": ["#2a78d6", "#eb6834"][k % 2],
+                "c": PALETTE_HEX[k % len(PALETTE_HEX)],
                 "v": [None if v is None else round(v, 2) for v in vs],
             }
             for k, (name, vs) in enumerate(series)
@@ -438,6 +444,167 @@ def _status_charts(rows, source_name):
     return f"<h1>{html.escape(title)}</h1>\n" + f'<div class="grid2">{"".join(charts)}</div>'
 
 
+# --- cross-antenna comparison -------------------------------------------
+#
+# Starlink and Kymeta expose overlapping information under different field
+# names. Each entry maps a canonical metric to the column patterns that
+# carry it, so both antennas can be drawn on one time axis.
+COMMON_METRICS = [
+    ("down_mbps", "下り スループット", "Mbps",
+     [r"^mbps_down$", r"downlink_throughput_bps$"]),
+    ("up_mbps", "上り スループット", "Mbps",
+     [r"^mbps_up$", r"uplink_throughput_bps$"]),
+    ("rtt_ms", "応答時間 (RTT)", "ms",
+     [r"^latency_ms$", r"pop_ping_latency_ms$", r"ping.*latency.*ms$"]),
+    ("loss", "パケットロス率", "",
+     [r"pop_ping_drop_rate$", r"drop_rate$", r"loss"]),
+    ("snr_db", "信号品質 (SNR / SINR / CNR)", "dB",
+     [r"sinr[_ ]?db$", r"\bsinr$", r"snr_db$", r"cnr[_ ]?db$", r"\bcnr$"]),
+    ("elevation", "仰角", "°",
+     [r"look[-_ ]?angle\.elevation$", r"\belevation$",
+      r"boresight_elevation_deg$"]),
+    ("azimuth", "方位角", "°",
+     [r"look[-_ ]?angle\.azimuth$", r"\bazimuth$", r"boresight_azimuth_deg$"]),
+    ("obstruction", "遮蔽 / 障害",  "",
+     [r"fraction_obstructed$", r"currently_obstructed$"]),
+]
+
+
+def _match_column(rows, patterns):
+    """First column matching any pattern, with a unit scale factor."""
+    import re
+
+    cols = list(rows[0].keys())
+    for pat in patterns:
+        rx = re.compile(pat, re.I)
+        for c in cols:
+            if rx.search(c):
+                vals = [_f(r, c) for r in rows]
+                if any(v is not None for v in vals):
+                    return c, (1e-6 if c.endswith("_bps") else 1.0)
+    return None, 1.0
+
+
+def _source_series(rundir):
+    """Canonical metric -> (label, epochs, values) for one run directory."""
+    rundir = Path(rundir)
+    label = rundir.name
+    summary_path = rundir / "summary.json"
+    if summary_path.exists():
+        try:
+            label = json.loads(summary_path.read_text(encoding="utf-8")).get(
+                "label", label
+            )
+        except Exception:
+            pass
+
+    out = {}
+    sources = [("測定", rundir / "throughput.csv")]
+    for antenna in ("starlink", "kymeta"):
+        sources.append((antenna.capitalize(), rundir / f"{antenna}_status.csv"))
+    for src_name, path in sources:
+        if not path.exists():
+            continue
+        rows = _read_csv(path)
+        if not rows:
+            continue
+        epochs = [_f(r, "epoch") for r in rows]
+        for key, _title, _unit, patterns in COMMON_METRICS:
+            col, scale = _match_column(rows, patterns)
+            if col is None:
+                continue
+            vals = [
+                None if _f(r, col) is None else _f(r, col) * scale for r in rows
+            ]
+            if not any(v is not None for v in vals):
+                continue
+            name = f"{src_name} ({label})" if label else src_name
+            out.setdefault(key, []).append((name, epochs, vals, col))
+    return label, out
+
+
+def _align(series_list):
+    """Resample series onto a shared 1-second grid keyed by epoch."""
+    starts = [min(e for e in eps if e) for _n, eps, _v, _c in series_list]
+    ends = [max(e for e in eps if e) for _n, eps, _v, _c in series_list]
+    t0, t1 = min(starts), max(ends)
+    n = int(t1 - t0) + 1
+    if n > 200000:  # safety for very long captures
+        n = 200000
+    grid = [t0 + i for i in range(n)]
+    aligned = []
+    for name, eps, vals, _col in series_list:
+        buf = [None] * n
+        for e, v in zip(eps, vals):
+            if e is None or v is None:
+                continue
+            i = int(round(e - t0))
+            if 0 <= i < n:
+                buf[i] = v
+        aligned.append((name, buf))
+    return grid, aligned, t0
+
+
+def generate_compare_report(rundirs, out_path=None) -> Path:
+    """One page comparing common metrics across runs/antennas by clock time."""
+    from datetime import datetime, timezone
+
+    per_metric = {}
+    labels = []
+    for d in rundirs:
+        label, metrics = _source_series(d)
+        labels.append(label)
+        for key, entries in metrics.items():
+            per_metric.setdefault(key, []).extend(entries)
+
+    body = [
+        "<h1>アンテナ比較レポート</h1>",
+        f'<div class="sub">対象: {html.escape(", ".join(labels))} — '
+        "同じ時刻軸で共通項目を重ねて表示しています</div>",
+    ]
+    charts = 0
+    for key, title, unit, _pat in COMMON_METRICS:
+        entries = per_metric.get(key)
+        if not entries or len(entries) < 1:
+            continue
+        grid, aligned, t0 = _align(entries)
+        ts = [t - t0 for t in grid]
+
+        def clock(sec, base=t0):
+            return datetime.fromtimestamp(base + sec, timezone.utc).strftime(
+                "%H:%M:%S"
+            )
+
+        cols = ", ".join(sorted({e[3] for e in entries}))
+        charts += 1
+        body.append(
+            svg_chart(
+                title,
+                f"元データ列: {cols}(時刻はUTC)",
+                ts,
+                aligned,
+                unit,
+                time_fmt=clock,
+            )
+        )
+    if not charts:
+        body.append(
+            '<div class="card">比較できる共通項目が見つかりませんでした。</div>'
+        )
+
+    out = Path(out_path) if out_path else Path(rundirs[0]).parent / "compare.html"
+    doc = (
+        "<!DOCTYPE html><html lang='ja'><head><meta charset='utf-8'>"
+        "<title>アンテナ比較レポート</title>"
+        "<meta name='viewport' content='width=device-width, initial-scale=1'>"
+        f"<style>{CSS}</style></head><body>"
+        + "\n".join(body)
+        + f"<script>{JS}</script></body></html>"
+    )
+    out.write_text(doc, encoding="utf-8")
+    return out
+
+
 def _tile(k, v, u=""):
     return (
         f'<div class="tile"><div class="k">{html.escape(k)}</div>'
@@ -516,6 +683,30 @@ def generate_report(rundir) -> Path:
                     phases=phases,
                 )
             )
+
+    # cross-source view: same metric from the measurement and the antenna
+    # on one time axis (e.g. measured RTT vs the dish's own ping latency)
+    _label, metrics = _source_series(rundir)
+    combined = []
+    for key, title, unit, _pat in COMMON_METRICS:
+        entries = metrics.get(key) or []
+        if len(entries) < 2:
+            continue  # only interesting when two sources report it
+        grid, aligned, t0 = _align(entries)
+        combined.append(
+            svg_chart(
+                title,
+                "測定値とアンテナ内部値の比較(元データ列: "
+                + ", ".join(sorted({e[3] for e in entries}))
+                + ")",
+                [t - t0 for t in grid],
+                aligned,
+                unit,
+            )
+        )
+    if combined:
+        body.append("<h1>測定値とアンテナ情報の比較</h1>")
+        body.extend(combined)
 
     for name in ("starlink", "kymeta"):
         p = rundir / f"{name}_status.csv"

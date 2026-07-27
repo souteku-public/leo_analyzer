@@ -131,6 +131,31 @@ python -m leo_analyzer --label oneweb_intellian --duration 10m --direction down
 | `--report DIR` | — | 既存の測定フォルダからグラフレポートを再生成 |
 | `--kymeta-array-interval` | 5 | スペクトラム取得の間隔(秒)。長時間測定では大きく |
 | `--keep-all-columns` | — | CSVを圧縮せず全項目を記録する |
+| `--compare DIR...` | — | 複数の測定を同じ時刻軸で比較する `compare.html` を生成 |
+
+### 長時間測定するPCの設定(Windows)
+
+**画面がロックされるだけなら測定は止まりません。**測定が止まるのは
+PCがスリープ/休止したときです。24時間測定の前に以下を設定してください:
+
+1. **スリープを無効化** — 設定 → システム → 電源とバッテリー →
+   「画面とスリープ」で、電源接続時の「次の時間が経過後にデバイスを
+   スリープ状態にする」を **「なし」** に
+2. **ノートPCは蓋を閉じても動作継続** — コントロールパネル →
+   電源オプション → 「カバーを閉じたときの動作」→ 電源接続時
+   **「何もしない」**
+3. **必ずAC電源に接続**(バッテリー駆動時は別設定が適用されます)
+4. **高速スタートアップ/自動更新の再起動に注意** — Windows Update の
+   アクティブ時間を測定時間帯に設定しておくと自動再起動を避けられます
+5. コマンドで一時的にスリープを抑止する方法もあります(測定用の
+   コマンドプロンプトを開いたまま実行):
+   ```
+   powercfg /change standby-timeout-ac 0
+   powercfg /change hibernate-timeout-ac 0
+   ```
+
+画面ロック自体は無害ですが、気になる場合は 設定 → アカウント →
+サインインオプション で「しばらく操作しなかった場合...」を「なし」に。
 
 ### 長時間測定とディスク容量
 
@@ -194,6 +219,33 @@ CSV(圧縮後)は24時間でも数十MB程度です。空きディスクが1GB�
 ```bash
 python -m leo_analyzer --report results/20260724_090000_starlink
 ```
+
+### アンテナ比較レポート(compare.html)
+
+StarlinkとKymetaなど**複数の測定を同じ時刻軸で重ねて比較**できます:
+
+```bash
+python -m leo_analyzer --compare results/20260727_0900_starlink results/20260727_0900_kymeta
+```
+
+`compare.html` が出力され、両者で共通して取得できる項目が
+1枚のグラフに重ねて表示されます:
+
+| 比較項目 | Starlink側の元データ | Kymeta側の元データ |
+|---|---|---|
+| 下り/上りスループット | `downlink/uplink_throughput_bps` | 測定値(throughput.csv) |
+| 応答時間(RTT) | `pop_ping_latency_ms` | 測定値 |
+| パケットロス率 | `pop_ping_drop_rate` | — |
+| 信号品質 | (SNRフラグ) | `tracking-metrics` の SINR |
+| 仰角 / 方位角 | `boresight_elevation/azimuth_deg` | Look Angle |
+| 遮蔽 | `fraction_obstructed` | — |
+
+時刻はUTCの実時刻で揃えるため、**別々に始めた測定でも同じ瞬間の値を
+縦に見比べられます**。片方にしかない項目はその系列だけが描画されます。
+
+単一測定の `report.html` にも、同じ仕組みで「測定値 vs アンテナ内部値」
+(例: 実測RTT と アンテナが報告するPOP応答時間)を重ねた比較セクションが
+入ります。
 
 CSVはExcelでそのまま開けます。すべてのCSVに共通の時刻列
 (`timestamp_utc`=世界標準時、`epoch`=通し秒)があるので、速度と
