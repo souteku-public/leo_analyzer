@@ -143,6 +143,12 @@ def build_parser():
         "save a lot of disk on long runs (default: 5)",
     )
     p.add_argument(
+        "--gzip-csv",
+        action="store_true",
+        help="write CSVs gzip-compressed (.csv.gz, roughly 1/10 the size); "
+        "reports read either form, Excel needs them unzipped first",
+    )
+    p.add_argument(
         "--keep-all-columns",
         action="store_true",
         help="write every telemetry field to the CSV, including fields "
@@ -301,10 +307,11 @@ async def run(args):
     rundir.mkdir(parents=True, exist_ok=True)
     print(f"output directory: {rundir}")
 
+    suffix = ".csv.gz" if args.gzip_csv else ".csv"
     stop = asyncio.Event()
     collectors = make_collectors(args)
     collector_tasks = [
-        asyncio.create_task(c.run(rundir / f"{c.name}_status.csv", stop))
+        asyncio.create_task(c.run(rundir / f"{c.name}_status{suffix}", stop))
         for c in collectors
     ]
 
@@ -327,7 +334,7 @@ async def run(args):
             from .speedtest import run_speedtest
 
             result = await run_speedtest(
-                rundir / "throughput.csv",
+                rundir / f"throughput{suffix}",
                 duration=args.duration,
                 streams=args.streams,
                 direction=args.direction,

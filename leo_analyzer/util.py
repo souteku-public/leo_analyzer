@@ -14,11 +14,17 @@ def epoch_now() -> float:
     return time.time()
 
 
+# A CSV cell longer than this is truncated: bulk payloads belong in the
+# per-endpoint .jsonl files, never repeated in every row of the CSV.
+MAX_CELL_CHARS = 400
+
+
 def flatten(obj, parent_key: str = "", sep: str = ".") -> dict:
     """Flatten nested dicts into dot-separated keys.
 
     Lists are JSON-encoded into a single cell so the CSV column set stays
-    stable even when list lengths vary between samples.
+    stable even when list lengths vary between samples; oversized values
+    are truncated with a marker so one fat field cannot bloat the file.
     """
     items = {}
     if isinstance(obj, dict):
@@ -27,12 +33,20 @@ def flatten(obj, parent_key: str = "", sep: str = ".") -> dict:
             if isinstance(v, dict):
                 items.update(flatten(v, key, sep))
             elif isinstance(v, list):
-                items[key] = json.dumps(v, ensure_ascii=False)
+                items[key] = _cap(json.dumps(v, ensure_ascii=False))
+            elif isinstance(v, str):
+                items[key] = _cap(v)
             else:
                 items[key] = v
     else:
         items[parent_key or "value"] = obj
     return items
+
+
+def _cap(text: str) -> str:
+    if len(text) <= MAX_CELL_CHARS:
+        return text
+    return f"{text[:MAX_CELL_CHARS]}...[{len(text)}文字を短縮]"
 
 
 class CsvLogger:
@@ -51,7 +65,14 @@ class CsvLogger:
     def write_row(self, row: dict):
         if self._writer is None:
             self._fields = list(row.keys())
-            self._file = open(self.path, "w", newline="", encoding="utf-8")
+            if str(self.path).endswith(".gz"):
+                import gzip
+
+                self._file = gzip.open(
+                    self.path, "wt", newline="", encoding="utf-8"
+                )
+            else:
+                self._file = open(self.path, "w", newline="", encoding="utf-8")
             self._writer = csv.DictWriter(
                 self._file, fieldnames=self._fields, extrasaction="ignore"
             )

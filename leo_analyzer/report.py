@@ -334,8 +334,22 @@ def svg_chart(title, caption, ts, series, unit, phases=None, colors=None,
 
 
 def _read_csv(path):
+    path = Path(path)
+    if path.suffix == ".gz":
+        import gzip
+
+        with gzip.open(path, "rt", encoding="utf-8") as f:
+            return list(csv.DictReader(f))
     with open(path, encoding="utf-8") as f:
         return list(csv.DictReader(f))
+
+
+def _find_csv(rundir, name):
+    """Return <name>.csv or its .gz variant, whichever exists."""
+    for candidate in (Path(rundir) / name, Path(rundir) / (name + ".gz")):
+        if candidate.exists():
+            return candidate
+    return None
 
 
 def _f(row, key):
@@ -499,11 +513,13 @@ def _source_series(rundir):
             pass
 
     out = {}
-    sources = [("測定", rundir / "throughput.csv")]
+    sources = [("測定", _find_csv(rundir, "throughput.csv"))]
     for antenna in ("starlink", "kymeta"):
-        sources.append((antenna.capitalize(), rundir / f"{antenna}_status.csv"))
+        sources.append(
+            (antenna.capitalize(), _find_csv(rundir, f"{antenna}_status.csv"))
+        )
     for src_name, path in sources:
-        if not path.exists():
+        if path is None:
             continue
         rows = _read_csv(path)
         if not rows:
@@ -647,8 +663,8 @@ def generate_report(rundir) -> Path:
     if tiles:
         body.append(f'<div class="tiles">{"".join(tiles)}</div>')
 
-    tp = rundir / "throughput.csv"
-    if tp.exists():
+    tp = _find_csv(rundir, "throughput.csv")
+    if tp is not None:
         rows = _read_csv(tp)
         if rows:
             t0 = _f(rows[0], "epoch")
@@ -709,8 +725,8 @@ def generate_report(rundir) -> Path:
         body.extend(combined)
 
     for name in ("starlink", "kymeta"):
-        p = rundir / f"{name}_status.csv"
-        if p.exists():
+        p = _find_csv(rundir, f"{name}_status.csv")
+        if p is not None:
             rows = _read_csv(p)
             if rows:
                 body.append(_status_charts(rows, name))

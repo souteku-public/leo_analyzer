@@ -144,6 +144,10 @@ _BUNDLE_MAX_BYTES = 8 * 1024 * 1024
 # as plot/spectrum data: full payload goes to a .jsonl file, and only a
 # per-second summary (points/min/max/avg) goes into the CSV
 ARRAY_MIN_LEN = 16
+# ...and so is any response bigger than this, whatever its shape. Spectrum
+# payloads come as nested pairs on some firmwares, which would otherwise be
+# JSON-encoded into a single CSV cell and bloat the file enormously.
+BULK_JSON_BYTES = 4096
 
 
 def default_config() -> dict:
@@ -170,8 +174,41 @@ def _path_to_name(path: str) -> str:
     return name.strip("_") or "root"
 
 
+def _numbers(seq):
+    """Flatten one level of a list into numbers, or None if not numeric.
+
+    Accepts [1,2,3] and pair/tuple forms like [[freq, power], ...] or
+    [{"x":.., "y":..}, ...] — the shapes spectrum plots actually use.
+    """
+    out = []
+    for item in seq:
+        if isinstance(item, bool):
+            return None
+        if isinstance(item, (int, float)):
+            out.append(item)
+        elif isinstance(item, (list, tuple)) and item:
+            nums = [
+                v for v in item
+                if isinstance(v, (int, float)) and not isinstance(v, bool)
+            ]
+            if len(nums) != len(item):
+                return None
+            out.append(nums[-1])  # last field is the value (x, y) -> y
+        elif isinstance(item, dict):
+            nums = [
+                v for v in item.values()
+                if isinstance(v, (int, float)) and not isinstance(v, bool)
+            ]
+            if not nums:
+                return None
+            out.append(nums[-1])
+        else:
+            return None
+    return out
+
+
 def _find_numeric_array(obj, min_len=ARRAY_MIN_LEN):
-    """Return the longest list of numbers found anywhere in the JSON."""
+    """Return the longest numeric series found anywhere in the JSON."""
     best = None
     stack = [obj]
     while stack:
@@ -179,15 +216,23 @@ def _find_numeric_array(obj, min_len=ARRAY_MIN_LEN):
         if isinstance(cur, dict):
             stack.extend(cur.values())
         elif isinstance(cur, list):
-            if len(cur) >= min_len and all(
-                isinstance(v, (int, float)) and not isinstance(v, bool)
-                for v in cur
-            ):
-                if best is None or len(cur) > len(best):
-                    best = cur
+            nums = _numbers(cur) if len(cur) >= min_len else None
+            if nums:
+                if best is None or len(nums) > len(best):
+                    best = nums
             else:
                 stack.extend(v for v in cur if isinstance(v, (dict, list)))
     return best
+
+
+def _is_bulk(data) -> bool:
+    """True when a payload belongs in a .jsonl file rather than the CSV."""
+    if _find_numeric_array(data) is not None:
+        return True
+    try:
+        return len(json.dumps(data, ensure_ascii=False)) > BULK_JSON_BYTES
+    except Exception:
+        return False
 
 
 class KymetaCollector(Collector):
@@ -271,10 +316,7 @@ class KymetaCollector(Collector):
             for ep in self.endpoints:
                 if "array" not in ep:
                     _, data = await self._try_json(ep["path"])
-                    ep["array"] = (
-                        data is not None
-                        and _find_numeric_array(data) is not None
-                    )
+                    ep["array"] = data is not None and _is_bulk(data)
 
         # websocket streams (plots/spectrum pages often push data live)
         self._ws_stop = asyncio.Event()
@@ -389,7 +431,7 @@ class KymetaCollector(Collector):
                 found.append({
                     "name": _path_to_name(path),
                     "path": path,
-                    "array": _find_numeric_array(data) is not None,
+                    "array": _is_bulk(data),
                 })
             elif status in (401, 403):
                 self.probe_log.append(f"{path}: HTTP {status} (認証拒否){note}")

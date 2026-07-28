@@ -92,9 +92,11 @@ class Collector:
             nonlocal keep, static
             keep, static = select_columns(learn_buf)
             if static:
-                path = Path(csv_path).with_name(
-                    Path(csv_path).stem + "_static.json"
-                )
+                stem = Path(csv_path).name
+                for ext in (".gz", ".csv"):
+                    if stem.endswith(ext):
+                        stem = stem[: -len(ext)]
+                path = Path(csv_path).with_name(stem + "_static.json")
                 path.write_text(
                     json.dumps(static, indent=2, ensure_ascii=False),
                     encoding="utf-8",
