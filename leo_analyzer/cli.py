@@ -149,6 +149,11 @@ def build_parser():
         "that never change or are never populated (default: compacted)",
     )
     p.add_argument(
+        "--kymeta-full",
+        action="store_true",
+        help="with --kymeta-probe, print every column instead of the first 40",
+    )
+    p.add_argument(
         "--kymeta-probe",
         action="store_true",
         help="probe the Kymeta antenna for JSON endpoints, print what was "
@@ -242,11 +247,22 @@ async def kymeta_probe(args):
 
     print(f"\nprobed {collector.base_url}: {len(collector.endpoints)} endpoint(s)")
     print(f"columns per sample: {len(sample)}")
-    shown = [k for k in sample if not k.endswith("._error")][:40]
-    for k in shown:
-        print(f"  {k} = {sample[k]}")
-    if len(sample) > len(shown):
-        print(f"  ... and {len(sample) - len(shown)} more columns")
+
+    dump = Path(args.outdir if args.outdir != "results" else ".") / "kymeta_sample.json"
+    dump.parent.mkdir(parents=True, exist_ok=True)
+    with open(dump, "w", encoding="utf-8") as f:
+        json.dump(sample, f, indent=2, ensure_ascii=False, default=str)
+
+    keys = [k for k in sample if not k.endswith("._error")]
+    if args.kymeta_full:
+        for k in keys:
+            print(f"  {k} = {sample[k]}")
+    else:
+        for k in keys[:40]:
+            print(f"  {k} = {sample[k]}")
+        if len(keys) > 40:
+            print(f"  ... 他 {len(keys) - 40} 列(全項目は --kymeta-full で表示)")
+    print(f"\n1サンプル分の全データを保存しました: {dump}")
 
     print("\n# config/kymeta.yaml snippet for these endpoints:")
     print(f'base_url: "{collector.base_url}"')
