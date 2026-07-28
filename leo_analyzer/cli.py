@@ -315,8 +315,11 @@ async def run(args):
         for c in collectors
     ]
 
+    from . import build_id
+
     summary = {
         "label": args.label,
+        "tool_version": build_id(),
         "started_utc": datetime.now(timezone.utc).isoformat(),
         "duration_per_direction_s": args.duration,
         "baseline_s": args.baseline,

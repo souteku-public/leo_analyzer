@@ -213,7 +213,10 @@ CSV(圧縮後)は24時間でも数十MB程度です。空きディスクが1GB�
 | `kymeta_<名前>.jsonl.gz` | スペクトラム等の配列データ(全データ・gzip圧縮) |
 | `kymeta_status_static.json` | 測定中ずっと同じ値だった項目(CSVから省いた分) |
 | `kymeta_ws_<名前>.jsonl` | WebSocketストリームの全受信メッセージ |
-| `summary.json` | 平均・最大・最小などのまとめ |
+| `summary.json` | 平均・最大・最小などのまとめ(`tool_version` にツールのバージョンを記録) |
+
+バージョンによって記録内容・形式が変わっています。どのバージョンで
+何が変わったかは [CHANGELOG.md](CHANGELOG.md) を参照してください。
 
 ### グラフレポート(report.html)
 
