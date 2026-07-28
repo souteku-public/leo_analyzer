@@ -155,6 +155,12 @@ def build_parser():
         "that never change or are never populated (default: compacted)",
     )
     p.add_argument(
+        "--starlink-probe",
+        action="store_true",
+        help="diagnose the Starlink dish connection step by step "
+        "(TCP, gRPC reflection, get_status) and exit",
+    )
+    p.add_argument(
         "--kymeta-full",
         action="store_true",
         help="with --kymeta-probe, print every column instead of the first 40",
@@ -220,6 +226,40 @@ def make_kymeta_collector(args):
     if args.keep_all_columns:
         cfg["compact"] = False
     return KymetaCollector(cfg)
+
+
+def starlink_probe(args):
+    print(f"Starlink ディッシュ診断: {args.starlink_addr}\n")
+    try:
+        from .collectors.starlink import StarlinkCollector
+    except ImportError as e:
+        print(f"  [NG ] 必要なライブラリが未インストール: {e}")
+        print("\n  対処: python -m pip install -r requirements.txt")
+        sys.exit(1)
+
+    collector = StarlinkCollector(addr=args.starlink_addr)
+    try:
+        report = collector.diagnose()
+    finally:
+        collector._close()
+
+    print(f"\n結論: {report.get('conclusion', '不明')}")
+    sample = report.get("sample")
+    if sample:
+        out = Path(
+            args.outdir if args.outdir != "results" else "."
+        ) / "starlink_sample.json"
+        out.parent.mkdir(parents=True, exist_ok=True)
+        with open(out, "w", encoding="utf-8") as f:
+            json.dump(sample, f, indent=2, ensure_ascii=False, default=str)
+        keys = list(sample)
+        for k in keys[:30]:
+            print(f"  {k} = {sample[k]}")
+        if len(keys) > 30:
+            print(f"  ... 他 {len(keys) - 30} 項目")
+        print(f"\n1サンプル分の全データを保存しました: {out}")
+    else:
+        sys.exit(1)
 
 
 async def kymeta_probe(args):
@@ -296,6 +336,10 @@ async def run(args):
 
         out = generate_report(args.report)
         print(f"report written: {out}")
+        return
+
+    if args.starlink_probe:
+        starlink_probe(args)
         return
 
     if args.kymeta_probe:

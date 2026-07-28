@@ -319,6 +319,26 @@ summary.json には最小・最大・平均などが分けて集計されます:
 ### Starlink
 
 Starlinkのルーター/アンテナのLANに接続したPCから実行してください。
+
+うまく取得できないときは診断コマンドで原因を切り分けられます:
+
+```bash
+python -m leo_analyzer --starlink-probe
+```
+
+「プロキシ環境変数 → TCP接続 → gRPCリフレクション → get_status取得」の
+4段階を順に確認し、どこで失敗しているかと対処方法を表示します
+(成功時は取得できる全項目を `starlink_sample.json` に保存)。
+
+よくある原因:
+
+| 症状 | 原因と対処 |
+|---|---|
+| TCP接続で失敗 | PCがStarlinkのLANにいない。ブラウザで `http://192.168.100.1/support/statistics` が開けるか確認。市販ルーター経由やバイパスモードでは `192.168.100.0/30` への静的ルートが必要 |
+| プロキシを検出 | 社内プロキシ設定があるとgRPCがLAN宛でもプロキシ経由になり失敗する(v0.7で自動的に無効化するよう修正済み) |
+| ライブラリ未導入 | `python -m pip install -r requirements.txt`(grpcio / protobuf / yagrc が必要) |
+| gRPCリフレクションで失敗 | ファームウェアが対応していない可能性。バージョンを添えてご連絡ください |
+
 アンテナ(`192.168.100.1`)から毎秒、SNR・POP応答時間・パケットロス率・
 遮蔽率・アンテナ向きなどを取得して記録します。特別な設定は不要です。
 
@@ -377,7 +397,7 @@ python -m leo_analyzer --kymeta-probe
 | `pip` が見つからない | `python -m pip install -r requirements.txt` を実行 |
 | `ModuleNotFoundError: No module named 'aiohttp'` | ライブラリ未インストール。ツールを起動すると自動インストールするか聞かれるので `Y` を入力(または `python -m pip install -r requirements.txt` を実行) |
 | 速度が明らかに低い | PCが衛星回線「経由」でネットに出ているか確認(社内LANやテザリング経由になっていないか)。PCのWi-Fiではなく有線接続推奨 |
-| Starlinkの情報が取れない | Starlink のLAN内から実行しているか確認。`192.168.100.1` にブラウザでアクセスできるかも確認 |
+| Starlinkの情報が取れない | `python -m leo_analyzer --starlink-probe` で原因を切り分け(下記参照) |
 | Kymetaの情報が取れない | `https://192.168.44.2` にブラウザでログインできるか確認。できる場合はWebGUIのHelpページ→APIタブでエンドポイントを確認し `config/kymeta.yaml` に記入 |
 | 測定を途中でやめたい | `Ctrl + C`(それまでのデータは保存されます) |
 

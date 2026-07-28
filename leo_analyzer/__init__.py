@@ -1,6 +1,6 @@
 """LEO satellite link throughput measurement and antenna telemetry logger."""
 
-__version__ = "0.6.0"
+__version__ = "0.7.0"
 
 
 def build_id() -> str:
