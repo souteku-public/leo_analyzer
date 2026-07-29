@@ -198,10 +198,18 @@ def build_parser():
         "(embedded spectrum data) into a companion .jsonl.gz, then exit",
     )
     p.add_argument(
+        "--measure",
+        choices=["full", "rtt", "none"],
+        default="full",
+        help="what to measure alongside the antenna telemetry: "
+        "'full' = max throughput + RTT (saturates the link), "
+        "'rtt' = latency only, no load (long drives, metered plans), "
+        "'none' = telemetry only (default: full)",
+    )
+    p.add_argument(
         "--collect-only",
         action="store_true",
-        help="log antenna telemetry without running the speed test "
-        "(runs for --duration seconds total)",
+        help="alias for --measure none (kept for compatibility)",
     )
     return p
 
@@ -403,10 +411,20 @@ async def run(args):
         await kymeta_probe(args)
         return
 
+    mode = "none" if args.collect_only else args.measure
+
     stamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
     rundir = Path(args.outdir) / f"{stamp}_{args.label}"
     rundir.mkdir(parents=True, exist_ok=True)
     print(f"output directory: {rundir}")
+    print(
+        "測定モード: "
+        + {
+            "full": "最大スループット + RTT(回線を飽和させます)",
+            "rtt": "RTTのみ(回線に負荷をかけません)",
+            "none": "アンテナ情報のみ",
+        }[mode]
+    )
 
     suffix = ".csv.gz" if args.gzip_csv else ".csv"
     stop = asyncio.Event()
@@ -427,13 +445,17 @@ async def run(args):
         "baseline_s": args.baseline,
         "streams": args.streams,
         "direction": args.direction,
+        "measure_mode": mode,
         "collectors": [c.name for c in collectors],
     }
 
     try:
-        if args.collect_only:
+        if mode == "none":
             if not collectors:
-                sys.exit("error: --collect-only requires at least one --collect")
+                sys.exit(
+                    "error: --measure none / --collect-only requires "
+                    "at least one --collect"
+                )
             await asyncio.sleep(args.duration)
         else:
             from .speedtest import run_speedtest
@@ -444,6 +466,7 @@ async def run(args):
                 streams=args.streams,
                 direction=args.direction,
                 baseline=args.baseline,
+                mode=mode,
             )
             summary.update(result)
     except KeyboardInterrupt:
@@ -508,17 +531,28 @@ def interactive_args():
     else:
         argv += ["--label", "measure"]
 
-    print("\n測定時間(下り・上りそれぞれ)。例: 300、10m(10分)、1h(1時間)")
+    print("\n測定内容を選んでください:")
+    print("  1) 最大スループット + RTT  (回線を飽和させます。通信量大)")
+    print("  2) RTTのみ                 (回線に負荷をかけません。長時間向き)")
+    print("  3) アンテナ情報のみ        (通信なし)")
+    mode = {"1": "full", "2": "rtt", "3": "none"}.get(_ask("番号を入力", "1"), "full")
+    argv += ["--measure", mode]
+
+    if mode == "full":
+        print("\n測定時間(下り・上りそれぞれ)。例: 300、10m(10分)、1h(1時間)")
+    else:
+        print("\n測定時間。例: 300、10m(10分)、1h(1時間)")
     duration = _ask("測定時間", "10m")
     argv += ["--duration", duration]
 
-    print("\n無負荷でのRTT測定時間(測定前と下り→上りの間の2回)。0で省略")
-    baseline = _ask("アイドルRTT測定時間", "5m")
-    argv += ["--baseline", baseline]
+    if mode == "full":
+        print("\n無負荷でのRTT測定時間(測定前と下り→上りの間の2回)。0で省略")
+        baseline = _ask("アイドルRTT測定時間", "5m")
+        argv += ["--baseline", baseline]
 
-    print("\n測定方向: both=下り→上りの順に両方 / down=下りのみ / up=上りのみ")
-    direction = _ask("方向", "both")
-    argv += ["--direction", direction]
+        print("\n測定方向: both=下り→上りの順に両方 / down=下りのみ / up=上りのみ")
+        direction = _ask("方向", "both")
+        argv += ["--direction", direction]
 
     print("\n次のコマンドと同じ内容で実行します:")
     print(f"  python -m leo_analyzer {' '.join(argv)}\n")

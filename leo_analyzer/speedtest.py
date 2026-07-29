@@ -146,12 +146,17 @@ async def run_speedtest(
     streams: int = 8,
     direction: str = "both",
     baseline: int = 15,
+    mode: str = "full",
 ) -> dict:
     """Run baseline/download/upload phases; returns per-phase summary stats.
 
     `baseline` seconds of latency-only probing (no load) run before the
     first transfer phase and between download and upload, so each run
     records idle RTT alongside loaded RTT. Set 0 to skip.
+
+    mode="rtt" skips the transfers entirely and probes latency for
+    `duration` seconds, which keeps the link unloaded — the right choice
+    for long drives where saturating the link would burn the data plan.
     """
     state = _State()
     stop_all = asyncio.Event()
@@ -179,27 +184,31 @@ async def run_speedtest(
         probe_task = asyncio.create_task(_latency_probe(session, state, stop_all))
 
         phases = []
-        if baseline > 0:
-            phases.append(("baseline", None))
-        if direction in ("both", "down"):
-            phases.append(("download", _download_worker))
-        if direction == "both" and baseline > 0:
-            phases.append(("baseline", None))
-        if direction in ("both", "up"):
-            phases.append(("upload", _upload_worker))
+        if mode == "rtt":
+            # latency only, for the whole requested duration
+            phases.append(("baseline", None, duration))
+        else:
+            if baseline > 0:
+                phases.append(("baseline", None, baseline))
+            if direction in ("both", "down"):
+                phases.append(("download", _download_worker, duration))
+            if direction == "both" and baseline > 0:
+                phases.append(("baseline", None, baseline))
+            if direction in ("both", "up"):
+                phases.append(("upload", _upload_worker, duration))
 
         try:
-            for phase_name, worker in phases:
+            for phase_name, worker, phase_seconds in phases:
                 state.phase = phase_name
                 if worker is None:  # latency-only baseline, no load
-                    await asyncio.sleep(baseline)
+                    await asyncio.sleep(phase_seconds)
                     continue
                 phase_stop = asyncio.Event()
                 workers = [
                     asyncio.create_task(worker(session, state, phase_stop))
                     for _ in range(streams)
                 ]
-                await asyncio.sleep(duration)
+                await asyncio.sleep(phase_seconds)
                 phase_stop.set()
                 for w in workers:
                     w.cancel()
