@@ -227,6 +227,32 @@ def make_collectors(args):
     return collectors
 
 
+def preflight(args, collectors):
+    """Warn loudly before a long run if an antenna is unreachable."""
+    for c in collectors:
+        if c.name != "starlink":
+            continue
+        from .collectors.starlink import check_tcp
+
+        ok, err = check_tcp(c.addr)
+        if ok:
+            print(f"[starlink] {c.addr} に到達できます")
+            continue
+        print(
+            "\n" + "!" * 62 + "\n"
+            f"警告: Starlink アンテナ({c.addr})に接続できません\n"
+            f"  {err}\n"
+            "  このまま測定を続けるとアンテナ情報は記録されません"
+            "(速度測定は実行されます)。\n"
+            "  ・PCがStarlinkのLANに接続されているか\n"
+            "  ・ブラウザで http://192.168.100.1 が開けるか\n"
+            "  ・OneWeb(SSM)も 192.168.100.1 を使うため、両方に同時接続して"
+            "いないか\n"
+            "  詳しい切り分けは python -m leo_analyzer --starlink-probe\n"
+            + "!" * 62 + "\n"
+        )
+
+
 def make_kymeta_collector(args):
     from .collectors.kymeta import KymetaCollector, default_config
 
@@ -385,6 +411,7 @@ async def run(args):
     suffix = ".csv.gz" if args.gzip_csv else ".csv"
     stop = asyncio.Event()
     collectors = make_collectors(args)
+    preflight(args, collectors)
     collector_tasks = [
         asyncio.create_task(c.run(rundir / f"{c.name}_status{suffix}", stop))
         for c in collectors

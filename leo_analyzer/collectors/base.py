@@ -2,6 +2,7 @@
 
 import asyncio
 import json
+import re
 import time
 from pathlib import Path
 
@@ -11,6 +12,21 @@ from ..util import CsvLogger, epoch_now, utc_now_iso
 # fields which never arrive (or never change) can be left out of the CSV.
 LEARN_SECONDS = 90
 ALWAYS_KEEP = ("timestamp_utc", "epoch", "error", "notes")
+MAX_ERROR_CHARS = 200
+# when an antenna keeps failing, slow down instead of hammering it every
+# second (and filling the CSV with identical errors)
+BACKOFF_STEPS = ((10, 5.0), (60, 15.0), (300, 30.0))
+
+
+def compact_error(exc) -> str:
+    """One-line, bounded error text — gRPC dumps span several lines."""
+    text = f"{type(exc).__name__}: {exc}"
+    text = re.sub(r"\s+", " ", text).strip()
+    # gRPC repeats the same message in debug_error_string; keep the first
+    text = re.split(r"\s*debug_error_string\s*=", text)[0].strip()
+    if len(text) > MAX_ERROR_CHARS:
+        text = text[:MAX_ERROR_CHARS] + "…"
+    return text
 
 
 def select_columns(rows):
@@ -115,18 +131,37 @@ class Collector:
             next_t = int(time.time()) + 1
             while not stop.is_set():
                 await asyncio.sleep(max(0.0, next_t - time.time()))
-                next_t += interval
+                # a slow or failing sample can put us behind by many ticks;
+                # skip the missed ones instead of firing them back to back
+                step = interval
+                for threshold, slowed in BACKOFF_STEPS:
+                    if errors >= threshold:
+                        step = max(step, slowed)
+                next_t += step
+                now = time.time()
+                if next_t <= now:
+                    next_t = int(now) + step
+
                 row = {"timestamp_utc": utc_now_iso(), "epoch": round(epoch_now(), 3)}
                 try:
                     data = await self.sample()
+                    if errors:
+                        print(f"[{self.name}] 取得を再開しました({errors}回の失敗後)")
                     row["error"] = ""
                     row.update(data)
                     errors = 0
                 except Exception as e:
                     errors += 1
-                    row["error"] = f"{type(e).__name__}: {e}"
-                    if errors in (1, 10) or errors % 60 == 0:
-                        print(f"[{self.name}] sample failed ({errors}x): {e}")
+                    row["error"] = compact_error(e)
+                    if errors in (1, 5, 30) or errors % 120 == 0:
+                        print(
+                            f"[{self.name}] 取得失敗 {errors} 回目: {row['error']}"
+                        )
+                        if errors == 5:
+                            print(
+                                f"[{self.name}] 失敗が続くため取得間隔を"
+                                "自動的に広げます(復旧すれば元に戻ります)"
+                            )
 
                 if not self.compact:
                     logger.write_row(row)
