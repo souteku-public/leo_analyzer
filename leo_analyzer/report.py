@@ -361,9 +361,12 @@ def _f(row, key):
     if v in ("False", "false"):
         return 0.0
     try:
-        return float(v)
+        f = float(v)
     except ValueError:
         return None
+    # the dish reports NaN for statistics it has no data for yet; a single
+    # NaN would poison a chart's axis range
+    return None if math.isnan(f) or math.isinf(f) else f
 
 
 def _phases_from_rows(rows, t0):
@@ -406,13 +409,18 @@ def _pick_columns(rows, max_cols=8):
     return [c for _, c in scores[:max_cols]]
 
 
+# field names as reported by a real Starlink Mini (sw 2026.07.09); the
+# obstruction fields differ between firmware versions, so list both
 STARLINK_PRIORITY = [
     "pop_ping_latency_ms",
     "pop_ping_drop_rate",
     "downlink_throughput_bps",
     "uplink_throughput_bps",
+    "obstruction_stats.time_obstructed",
     "obstruction_stats.fraction_obstructed",
     "obstruction_stats.currently_obstructed",
+    "boresight_azimuth_deg",
+    "boresight_elevation_deg",
     "is_snr_above_noise_floor",
     "gps_stats.gps_sats",
 ]
@@ -480,7 +488,7 @@ COMMON_METRICS = [
     ("azimuth", "方位角", "°",
      [r"look[-_ ]?angle\.azimuth$", r"\bazimuth$", r"boresight_azimuth_deg$"]),
     ("obstruction", "遮蔽 / 障害",  "",
-     [r"fraction_obstructed$", r"currently_obstructed$"]),
+     [r"fraction_obstructed$", r"time_obstructed$", r"currently_obstructed$"]),
 ]
 
 
