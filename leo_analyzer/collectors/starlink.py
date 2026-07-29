@@ -8,12 +8,17 @@ built-in router default).
 """
 
 import asyncio
+import os
 import socket
 
-from google.protobuf.json_format import MessageToDict
+# Prefer protobuf's pure-Python implementation: on locked-down Windows
+# machines the native accelerator can be blocked by application control.
+os.environ.setdefault("PROTOCOL_BUFFERS_PYTHON_IMPLEMENTATION", "python")
 
-from ..util import flatten
-from .base import Collector
+from google.protobuf.json_format import MessageToDict  # noqa: E402
+
+from ..util import flatten  # noqa: E402
+from .base import Collector  # noqa: E402
 
 DEFAULT_ADDR = "192.168.100.1:9200"
 
@@ -41,13 +46,35 @@ def check_tcp(addr: str, timeout: float = 3.0):
 class StarlinkCollector(Collector):
     name = "starlink"
 
-    def __init__(self, addr: str = DEFAULT_ADDR):
+    def __init__(self, addr: str = DEFAULT_ADDR, transport: str = "auto"):
         self.addr = addr
+        self.transport = transport  # auto | grpc | pure
         self._channel = None
         self._stub = None
         self._request_class = None
+        self._pure = None
 
     def _connect(self):
+        """Open a channel, falling back to the pure-Python transport.
+
+        grpcio's native extension is unavailable on some managed Windows
+        machines (application control blocks cygrpc.pyd), so the pure
+        HTTP/2 client takes over transparently.
+        """
+        if self.transport != "pure":
+            try:
+                self._connect_grpcio()
+                return
+            except ImportError as e:
+                if self.transport == "grpc":
+                    raise
+                print(
+                    f"[starlink] grpcio を使用できません({e})。"
+                    "純Python実装(h2)で接続します"
+                )
+        self._connect_pure()
+
+    def _connect_grpcio(self):
         import grpc
         from yagrc import reflector as yagrc_reflector
 
@@ -59,14 +86,22 @@ class StarlinkCollector(Collector):
         self._stub = stub_class(channel)
         self._channel = channel
 
+    def _connect_pure(self):
+        from .starlink_pure import PureDishClient
+
+        client = PureDishClient(self.addr)
+        client.connect()
+        self._pure = client
+
     def _sample_blocking(self) -> dict:
-        if self._stub is None:
+        if self._stub is None and self._pure is None:
             self._connect()
-        request = self._request_class(get_status={})
-        response = self._stub.Handle(request, timeout=5)
-        status = MessageToDict(
-            response.dish_get_status, preserving_proto_field_name=True
-        )
+        if self._pure is not None:
+            message = self._pure.get_status()
+        else:
+            request = self._request_class(get_status={})
+            message = self._stub.Handle(request, timeout=5).dish_get_status
+        status = MessageToDict(message, preserving_proto_field_name=True)
         if not status:
             raise ValueError(
                 "dish_get_status が空です(ディッシュが応答しましたが"
@@ -84,13 +119,15 @@ class StarlinkCollector(Collector):
             raise
 
     def _close(self):
-        if self._channel is not None:
-            try:
-                self._channel.close()
-            except Exception:
-                pass
+        for closable in (self._channel, self._pure):
+            if closable is not None:
+                try:
+                    closable.close()
+                except Exception:
+                    pass
         self._channel = None
         self._stub = None
+        self._pure = None
 
     async def teardown(self):
         self._close()
@@ -133,14 +170,30 @@ class StarlinkCollector(Collector):
             )
             return report
 
+        # which transport can this machine actually use?
+        try:
+            import grpc  # noqa: F401
+            from yagrc import reflector  # noqa: F401
+
+            step("grpcio ライブラリ", True, "利用可能")
+        except ImportError as e:
+            step(
+                "grpcio ライブラリ",
+                True,
+                f"使用不可({e})— 純Python実装(h2)に切り替えます",
+                level="注意",
+            )
+
         try:
             self._connect()
-            step("gRPCリフレクション", True, "SpaceX.API.Device.Device を取得")
+            used = "純Python(h2)" if self._pure is not None else "grpcio"
+            step("gRPCリフレクション", True, f"{used} で接続、記述子を取得")
         except Exception as e:
             step("gRPCリフレクション", False, f"{type(e).__name__}: {e}")
             report["conclusion"] = (
-                "TCPは通るがgRPCが応答しません。ファームウェアが"
-                "リフレクションを無効化している可能性があります"
+                "TCPは通りますがgRPC接続に失敗しました。"
+                "h2ライブラリが未導入の場合は "
+                "python -m pip install -r requirements.txt を実行してください"
             )
             return report
 

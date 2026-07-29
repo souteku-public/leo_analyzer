@@ -336,8 +336,14 @@ python -m leo_analyzer --starlink-probe
 |---|---|
 | TCP接続で失敗 | PCがStarlinkのLANにいない。ブラウザで `http://192.168.100.1/support/statistics` が開けるか確認。市販ルーター経由やバイパスモードでは `192.168.100.0/30` への静的ルートが必要 |
 | プロキシを検出 | 社内プロキシ設定があるとgRPCがLAN宛でもプロキシ経由になり失敗する(v0.7で自動的に無効化するよう修正済み) |
-| ライブラリ未導入 | `python -m pip install -r requirements.txt`(grpcio / protobuf / yagrc が必要) |
+| `DLL load failed while importing cygrpc` | 会社支給PCなどでWindowsのアプリケーション制御ポリシーがgrpcioのDLLをブロックしている。**v0.8以降は純Python実装(h2)へ自動的に切り替わる**ので対処不要 |
+| ライブラリ未導入 | `python -m pip install -r requirements.txt`(protobuf と h2 が必要) |
 | gRPCリフレクションで失敗 | ファームウェアが対応していない可能性。バージョンを添えてご連絡ください |
+
+**接続方式について**: 既定(`auto`)ではgrpcioを試し、使えない場合は
+DLLを使わない純Python実装(h2ライブラリ)に自動で切り替えます。
+`--starlink-transport pure` で常に純Python実装を使うこともできます
+(取得できるデータは同一です)。
 
 アンテナ(`192.168.100.1`)から毎秒、SNR・POP応答時間・パケットロス率・
 遮蔽率・アンテナ向きなどを取得して記録します。特別な設定は不要です。

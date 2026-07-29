@@ -1,6 +1,7 @@
 aiohttp>=3.9
 PyYAML>=6.0
 # Starlink telemetry (--collect starlink) にのみ必要
-grpcio>=1.60
 protobuf>=4.25
+h2>=4.1          # 純Python gRPC(grpcioが使えない環境用・DLL不要)
+grpcio>=1.60     # 使えれば利用、ブロックされていれば h2 に自動切替
 yagrc>=1.1.2

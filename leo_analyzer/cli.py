@@ -155,6 +155,13 @@ def build_parser():
         "that never change or are never populated (default: compacted)",
     )
     p.add_argument(
+        "--starlink-transport",
+        choices=["auto", "grpc", "pure"],
+        default="auto",
+        help="how to reach the dish: auto (grpcio, falling back to the "
+        "pure-Python HTTP/2 client), or force one of them",
+    )
+    p.add_argument(
         "--starlink-probe",
         action="store_true",
         help="diagnose the Starlink dish connection step by step "
@@ -201,10 +208,12 @@ def make_collectors(args):
                 from .collectors.starlink import StarlinkCollector
             except ImportError as e:
                 sys.exit(
-                    "error: --collect starlink requires grpcio/protobuf/yagrc "
-                    f"(pip install -r requirements.txt): {e}"
+                    "error: --collect starlink requires protobuf and h2 "
+                    f"(python -m pip install -r requirements.txt): {e}"
                 )
-            c = StarlinkCollector(addr=args.starlink_addr)
+            c = StarlinkCollector(
+                addr=args.starlink_addr, transport=args.starlink_transport
+            )
             c.compact = not args.keep_all_columns
             collectors.append(c)
         elif name == "kymeta":
@@ -237,7 +246,9 @@ def starlink_probe(args):
         print("\n  対処: python -m pip install -r requirements.txt")
         sys.exit(1)
 
-    collector = StarlinkCollector(addr=args.starlink_addr)
+    collector = StarlinkCollector(
+        addr=args.starlink_addr, transport=args.starlink_transport
+    )
     try:
         report = collector.diagnose()
     finally:

@@ -9,6 +9,17 @@ UTCなので、突き合わせる際は9時間の差にご注意ください)。
 
 ---
 
+## v0.8 — 2026-07-29(水)20:00 JST
+
+**Starlinkのデータが取れなかった環境への対応**
+
+- **純Python版のgRPCクライアントを追加**。会社支給PCなどでWindowsの
+  アプリケーション制御ポリシーが grpcio のネイティブDLL(`cygrpc.pyd`)を
+  ブロックしている環境でも、DLLを使わずに(h2ライブラリで)アンテナ情報を
+  取得できるようにした。既定は自動切替(`--starlink-transport`)
+- protobufも純Python実装を使うよう指定(同様のDLLブロック対策)
+- `--starlink-probe` の診断に「grpcioが使えるか」の判定を追加
+
 ## v0.7 — 2026-07-28(火)18:20 JST
 
 - **Starlink接続の診断コマンド `--starlink-probe` を追加**。
