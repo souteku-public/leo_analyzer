@@ -135,6 +135,14 @@ PHASE_LABELS = {"baseline": "無負荷", "download": "下り測定", "upload": "
 # categorical slots (validated order); index k -> CSS var / literal hex
 PALETTE_VARS = [f"var(--s{i})" for i in range(1, 7)]
 PALETTE_HEX = ["#2a78d6", "#eb6834", "#1baf7a", "#eda100", "#e87ba4", "#008300"]
+# sequential blue ramp used by the spectrum waterfall legend
+_RAMP = [
+    (0xCD, 0xE2, 0xFB), (0xB7, 0xD3, 0xF6), (0x9E, 0xC5, 0xF4),
+    (0x86, 0xB6, 0xEF), (0x6D, 0xA7, 0xEC), (0x55, 0x98, 0xE7),
+    (0x39, 0x87, 0xE5), (0x2A, 0x78, 0xD6), (0x25, 0x6A, 0xBF),
+    (0x1C, 0x5C, 0xAB), (0x18, 0x4F, 0x95), (0x10, 0x42, 0x81),
+    (0x0D, 0x36, 0x6B),
+]
 
 
 def _fmt_elapsed(sec):
@@ -629,6 +637,71 @@ def generate_compare_report(rundirs, out_path=None) -> Path:
     return out
 
 
+def _spectrum_cards(rundir):
+    """Waterfall (time x frequency) rendered from the stored sweeps."""
+    from base64 import b64encode
+
+    from .spectrum import find_spectrum_files, load_sweeps, waterfall_png
+
+    cards = []
+    for path in find_spectrum_files(rundir):
+        try:
+            epochs, sweeps = load_sweeps(path)
+        except Exception:
+            continue
+        if not sweeps:
+            continue
+        png, w, h, lo, hi = waterfall_png(sweeps)
+        if not png:
+            continue
+        uri = "data:image/png;base64," + b64encode(png).decode()
+
+        span = ""
+        times = [e for e in epochs if e]
+        if len(times) > 1:
+            span = f" / 記録時間 {_fmt_elapsed(times[-1] - times[0])}"
+        x0, y0 = 58, 14
+        plot_w, plot_h = W - x0 - 16, 300
+        parts = [
+            f'<image x="{x0}" y="{y0}" width="{plot_w}" height="{plot_h}" '
+            f'preserveAspectRatio="none" href="{uri}"/>',
+            f'<rect x="{x0}" y="{y0}" width="{plot_w}" height="{plot_h}" '
+            f'fill="none" stroke="var(--axis)"/>',
+            f'<text x="{x0 - 8}" y="{y0 + 10}" font-size="11" fill="var(--muted)" '
+            f'text-anchor="end">高</text>',
+            f'<text x="{x0 - 8}" y="{y0 + plot_h}" font-size="11" '
+            f'fill="var(--muted)" text-anchor="end">低</text>',
+            f'<text x="{x0}" y="{y0 + plot_h + 16}" font-size="11" '
+            f'fill="var(--muted)">測定開始</text>',
+            f'<text x="{x0 + plot_w}" y="{y0 + plot_h + 16}" font-size="11" '
+            f'fill="var(--muted)" text-anchor="end">終了</text>',
+        ]
+        # colour legend
+        lx = x0 + plot_w - 170
+        for i in range(13):
+            parts.append(
+                f'<rect x="{lx + i * 10}" y="{y0 + plot_h + 24}" width="10" '
+                f'height="8" fill="rgb({",".join(str(c) for c in _RAMP[i])})"/>'
+            )
+        parts.append(
+            f'<text x="{lx - 6}" y="{y0 + plot_h + 32}" font-size="11" '
+            f'fill="var(--muted)" text-anchor="end">弱 {lo:.0f}</text>'
+        )
+        parts.append(
+            f'<text x="{lx + 136}" y="{y0 + plot_h + 32}" font-size="11" '
+            f'fill="var(--muted)">{hi:.0f} 強</text>'
+        )
+        cards.append(
+            f'<div class="card"><h2>スペクトラム(ウォーターフォール)</h2>'
+            f'<div class="cap">縦=周波数 / 横=時間 / 色=信号強度。'
+            f"{len(sweeps):,} スイープ × {h} ビン{span}"
+            f"(元データ: {html.escape(path.name)})</div>"
+            f'<svg viewBox="0 0 {W} {y0 + plot_h + 40}">{"".join(parts)}</svg>'
+            f"</div>"
+        )
+    return cards
+
+
 def _tile(k, v, u=""):
     return (
         f'<div class="tile"><div class="k">{html.escape(k)}</div>'
@@ -731,6 +804,8 @@ def generate_report(rundir) -> Path:
     if combined:
         body.append("<h1>測定値とアンテナ情報の比較</h1>")
         body.extend(combined)
+
+    body.extend(_spectrum_cards(rundir))
 
     for name in ("starlink", "kymeta"):
         p = _find_csv(rundir, f"{name}_status.csv")
