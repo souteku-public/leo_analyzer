@@ -192,6 +192,12 @@ def build_parser():
         "runs (e.g. Starlink vs Kymeta) on one time axis, then exit",
     )
     p.add_argument(
+        "--shrink-csv",
+        metavar="FILE",
+        help="rewrite an oversized telemetry CSV, moving huge cells "
+        "(embedded spectrum data) into a companion .jsonl.gz, then exit",
+    )
+    p.add_argument(
         "--collect-only",
         action="store_true",
         help="log antenna telemetry without running the speed test "
@@ -335,6 +341,20 @@ async def kymeta_probe(args):
 
 
 async def run(args):
+    if args.shrink_csv:
+        from .shrink import shrink_csv
+
+        slim, bulk, st = shrink_csv(args.shrink_csv)
+        print(f"元ファイル: {args.shrink_csv}")
+        print(f"  {st['rows']:,} 行を処理、{st['moved_cells']:,} セルを分離")
+        for col, size in sorted(
+            st["bulk_columns"].items(), key=lambda kv: -kv[1]
+        ):
+            print(f"    {col}: {size / 1e6:.1f} MB")
+        print(f"軽量CSV : {slim}  ({st['slim_bytes'] / 1e6:.1f} MB)")
+        print(f"分離データ: {bulk}  ({st['bulk_bytes'] / 1e6:.1f} MB)")
+        return
+
     if args.compare:
         from .report import generate_compare_report
 

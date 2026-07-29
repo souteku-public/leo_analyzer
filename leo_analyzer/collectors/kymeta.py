@@ -17,8 +17,11 @@ into one CSV row (keys prefixed with the endpoint name).
 """
 
 import asyncio
+import base64
 import json
+import math
 import re
+import struct
 import time
 
 import aiohttp
@@ -148,6 +151,9 @@ ARRAY_MIN_LEN = 16
 # payloads come as nested pairs on some firmwares, which would otherwise be
 # JSON-encoded into a single CSV cell and bloat the file enormously.
 BULK_JSON_BYTES = 4096
+# a single string this long is bulk too: the u8 returns spectrum samples as
+# one base64-encoded float32 blob, which is not a JSON list at all
+BULK_STRING_CHARS = 2048
 
 
 def default_config() -> dict:
@@ -225,9 +231,55 @@ def _find_numeric_array(obj, min_len=ARRAY_MIN_LEN):
     return best
 
 
+def _longest_string(obj) -> str:
+    """Longest string value anywhere in the JSON (spectrum blobs are b64)."""
+    best = ""
+    stack = [obj]
+    while stack:
+        cur = stack.pop()
+        if isinstance(cur, dict):
+            stack.extend(cur.values())
+        elif isinstance(cur, list):
+            stack.extend(cur)
+        elif isinstance(cur, str) and len(cur) > len(best):
+            best = cur
+    return best
+
+
+def _decode_float_blob(text: str):
+    """Decode a base64 float32 array, as the u8 returns for adc-data."""
+    if len(text) < 64:
+        return None
+    try:
+        raw = base64.b64decode(text + "=" * (-len(text) % 4), validate=True)
+    except Exception:
+        return None
+    count = len(raw) // 4
+    if count < ARRAY_MIN_LEN:
+        return None
+    values = struct.unpack("<%df" % count, raw[: count * 4])
+    finite = [v for v in values if math.isfinite(v)]
+    if len(finite) < count * 0.9:
+        return None  # not float32 after all
+    # guard against a misread stride: real samples are ordinary magnitudes,
+    # a wrong alignment produces 1e30-scale garbage
+    wild = sum(1 for v in finite if abs(v) > 1e12)
+    return finite if wild <= len(finite) * 0.05 else None
+
+
+def bulk_values(data):
+    """Numeric series inside a payload, including base64 float blobs."""
+    array = _find_numeric_array(data)
+    if array:
+        return array
+    return _decode_float_blob(_longest_string(data))
+
+
 def _is_bulk(data) -> bool:
     """True when a payload belongs in a .jsonl file rather than the CSV."""
     if _find_numeric_array(data) is not None:
+        return True
+    if len(_longest_string(data)) > BULK_STRING_CHARS:
         return True
     try:
         return len(json.dumps(data, ensure_ascii=False)) > BULK_JSON_BYTES
@@ -638,11 +690,20 @@ class KymetaCollector(Collector):
                         continue
                     self._last_array_fetch[name] = now
                 data = await self._fetch(ep["path"])
+                if not ep.get("array") and _is_bulk(data):
+                    # an endpoint can be small at discovery time (spectrum
+                    # idle) and huge later; re-classify instead of writing
+                    # the payload into every CSV row
+                    ep["array"] = True
+                    print(
+                        f"[kymeta] {ep['path']} が大容量データを返し始めたため "
+                        f"kymeta_{name}.jsonl.gz への記録に切り替えます"
+                    )
                 if ep.get("array"):
                     # plots/spectrum payload: full data to jsonl, summary
                     # scalars to the CSV
                     self._jsonl_write(name, data)
-                    arr = _find_numeric_array(data)
+                    arr = bulk_values(data)
                     if arr:
                         row[f"{name}.points"] = len(arr)
                         row[f"{name}.min"] = round(min(arr), 3)
