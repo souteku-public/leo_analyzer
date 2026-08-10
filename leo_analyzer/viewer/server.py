@@ -18,6 +18,7 @@ from . import data as data_mod
 from . import sky, weather
 
 HERE = Path(__file__).resolve().parent
+APP_HTML = HERE.parent.parent / "viewer.html"
 TILE_URL = "https://tile.openstreetmap.org/{z}/{x}/{y}.png"
 _tile_cache = {}
 _tile_lock = threading.Lock()
@@ -59,7 +60,7 @@ class Handler(BaseHTTPRequestHandler):
         try:
             if route in ("/", "/index.html"):
                 self._send(
-                    (HERE / "app.html").read_bytes(), "text/html; charset=utf-8"
+                    APP_HTML.read_bytes(), "text/html; charset=utf-8"
                 )
             elif route == "/api/browse":
                 self._json(data_mod.list_dir(arg("path", str(Path.cwd()))))

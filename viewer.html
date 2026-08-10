@@ -1,0 +1,852 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<title>LEO データビューア</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<style>
+:root{
+  color-scheme: light dark;
+  --surface:#fcfcfb; --page:#f9f9f7; --ink:#0b0b0b; --ink-2:#52514e;
+  --muted:#898781; --grid:#e1e0d9; --axis:#c3c2b7; --border:rgba(11,11,11,.10);
+  --s1:#2a78d6; --s2:#eb6834; --s3:#1baf7a; --s4:#eda100; --crit:#d03b3b;
+}
+@media (prefers-color-scheme:dark){:root{
+  --surface:#1a1a19; --page:#0d0d0d; --ink:#fff; --ink-2:#c3c2b7;
+  --grid:#2c2c2a; --axis:#383835; --border:rgba(255,255,255,.10);
+  --s1:#3987e5; --s2:#d95926; --s3:#199e70; --s4:#c98500;
+}}
+*{box-sizing:border-box}
+body{margin:0;background:var(--page);color:var(--ink);
+  font-family:system-ui,-apple-system,"Segoe UI",sans-serif;font-size:14px}
+header{display:flex;gap:12px;align-items:center;flex-wrap:wrap;
+  padding:10px 16px;background:var(--surface);border-bottom:1px solid var(--border)}
+h1{font-size:16px;margin:0 12px 0 0}
+button,select,input{font:inherit;color:var(--ink);background:var(--surface);
+  border:1px solid var(--border);border-radius:6px;padding:5px 10px}
+button{cursor:pointer}
+button.primary{background:var(--s1);color:#fff;border-color:transparent}
+button:disabled{opacity:.45;cursor:default}
+main{display:grid;grid-template-columns:1fr 1fr;gap:14px;padding:14px}
+@media (max-width:980px){main{grid-template-columns:1fr}}
+.card{background:var(--surface);border:1px solid var(--border);border-radius:8px;
+  padding:12px;min-width:0}
+.card h2{font-size:13px;margin:0 0 8px;color:var(--ink-2);font-weight:600}
+.full{grid-column:1/-1}
+canvas{display:block;width:100%;height:auto;border-radius:6px}
+#timeline{width:100%}
+.tiles{display:flex;gap:10px;flex-wrap:wrap;margin-bottom:8px}
+.tile{background:var(--page);border:1px solid var(--border);border-radius:6px;
+  padding:6px 10px;min-width:96px}
+.tile .k{font-size:11px;color:var(--muted)}
+.tile .v{font-size:19px;font-variant-numeric:tabular-nums}
+.tile .u{font-size:11px;color:var(--muted);margin-left:2px}
+.row{display:flex;gap:8px;align-items:center;flex-wrap:wrap}
+.muted{color:var(--muted);font-size:12px}
+.legend{display:flex;gap:14px;font-size:12px;color:var(--ink-2);margin-top:6px;
+  flex-wrap:wrap}
+.sw{display:inline-block;width:10px;height:10px;border-radius:3px;margin-right:5px}
+dialog{border:1px solid var(--border);border-radius:10px;background:var(--surface);
+  color:var(--ink);max-width:min(760px,92vw);width:100%}
+dialog::backdrop{background:rgba(0,0,0,.45)}
+.list{max-height:50vh;overflow:auto;border:1px solid var(--border);
+  border-radius:6px;margin:8px 0}
+.list div{padding:6px 10px;cursor:pointer;border-bottom:1px solid var(--border);
+  display:flex;justify-content:space-between;gap:10px}
+.list div:hover{background:var(--page)}
+.badge{font-size:11px;color:#fff;background:var(--s3);border-radius:10px;
+  padding:1px 7px}
+#status{font-size:12px;color:var(--muted)}
+</style>
+</head>
+<body>
+<header>
+  <h1>LEO データビューア</h1>
+  <button id="pick" class="primary">データを選択…</button>
+  <input id="fileInput" type="file" multiple accept=".csv,.gz" hidden>
+  <input id="dirInput" type="file" webkitdirectory directory hidden>
+  <span id="srcName" class="muted">未選択</span>
+  <span style="flex:1"></span>
+  <label class="muted">粒度
+    <select id="step">
+      <option value="1">1秒</option><option value="5">5秒</option>
+      <option value="10" selected>10秒</option><option value="30">30秒</option>
+      <option value="60">1分</option><option value="300">5分</option>
+    </select>
+  </label>
+  <label class="muted">再生速度
+    <select id="speed">
+      <option value="1">×1</option><option value="5" selected>×5</option>
+      <option value="20">×20</option><option value="60">×60</option>
+    </select>
+  </label>
+  <button id="play" disabled>▶ 再生</button>
+</header>
+
+<div style="padding:0 16px 6px">
+  <input id="timeline" type="range" min="0" max="0" value="0" disabled>
+  <div class="row">
+    <strong id="clock">—</strong>
+    <span id="status" style="flex:1"></span>
+  </div>
+</div>
+
+<main>
+  <section class="card full">
+    <div class="tiles" id="tiles"></div>
+    <canvas id="strip" height="150"></canvas>
+    <div class="legend">
+      <span><span class="sw" style="background:var(--s1)"></span>下り Mbps</span>
+      <span><span class="sw" style="background:var(--s2)"></span>上り Mbps</span>
+      <span><span class="sw" style="background:var(--s3)"></span>RTT ms</span>
+      <span><span class="sw" style="background:var(--s4)"></span>SINR dB</span>
+      <span class="muted">縦線=再生位置。クリックでその時刻へ移動</span>
+    </div>
+  </section>
+
+  <section class="card">
+    <h2>上空の衛星とアンテナ指向(スカイビュー)</h2>
+    <canvas id="sky" height="440"></canvas>
+    <div class="legend">
+      <span><span class="sw" style="background:var(--s1)"></span>Starlink</span>
+      <span><span class="sw" style="background:var(--s2)"></span>OneWeb</span>
+      <span><span class="sw" style="background:var(--crit)"></span>アンテナ指向</span>
+      <span class="muted">中心=天頂 / 外周=地平線</span>
+    </div>
+    <div class="row" style="margin-top:6px">
+      <label class="muted">最低仰角
+        <select id="minEl">
+          <option value="0">0°</option><option value="10" selected>10°</option>
+          <option value="25">25°</option><option value="40">40°</option>
+        </select>
+      </label>
+      <span id="satInfo" class="muted"></span>
+    </div>
+  </section>
+
+  <section class="card">
+    <h2>雨雲とアンテナ位置</h2>
+    <canvas id="map" height="440"></canvas>
+    <div class="row" style="margin-top:6px">
+      <span id="posInfo" class="muted"></span>
+      <span style="flex:1"></span>
+      <button id="setPos">地図上で位置を指定</button>
+      <button id="zoomIn">＋</button><button id="zoomOut">−</button>
+    </div>
+    <div class="legend">
+      <span class="muted">降水量 mm/h:</span>
+      <span><span class="sw" style="background:#cde2fb"></span>0.1</span>
+      <span><span class="sw" style="background:#6da7ec"></span>1</span>
+      <span><span class="sw" style="background:#2a78d6"></span>5</span>
+      <span><span class="sw" style="background:#184f95"></span>10</span>
+      <span><span class="sw" style="background:#eb6834"></span>30+</span>
+      <span id="rainInfo" class="muted"></span>
+    </div>
+  </section>
+</main>
+
+<dialog id="browser">
+  <div style="padding:14px">
+    <div class="row">
+      <strong>データの場所を選択</strong><span style="flex:1"></span>
+      <button id="closeBrowser">閉じる</button>
+    </div>
+    <div class="row" style="margin-top:8px">
+      <input id="pathInput" style="flex:1" placeholder="フォルダのパスを直接入力">
+      <button id="goPath">移動</button>
+      <button id="useThis" class="primary">このフォルダを読み込む</button>
+    </div>
+    <div class="list" id="list"></div>
+    <div class="muted">フォルダを選ぶとその中のCSVをまとめて読み込みます。
+      <span class="badge">計測データ</span> はCSVを含むフォルダです。</div>
+  </div>
+</dialog>
+
+<!-- satellite.js v5.0.0 (MIT) — SGP4 in the browser so this file works
+     without Python. https://github.com/shashwatak/satellite-js -->
+<script>
+/*!
+ * satellite-js v5.0.0
+ * (c) 2013 Shashwat Kandadai and UCSC
+ * https://github.com/shashwatak/satellite-js
+ * License: MIT
+ */
+
+!function(o,t){"object"==typeof exports&&"undefined"!=typeof module?module.exports=t():"function"==typeof define&&define.amd?define(t):(o="undefined"!=typeof globalThis?globalThis:o||self).satellite=t()}(this,(function(){"use strict";var o=Math.PI,t=2*o,e=o/180,s=180/o,a=1440,n=398600.8,d=6378.135,r=60/Math.sqrt(650942.9922085947),i=d*r/60,c=1/r,h=.001082616,m=-253881e-11,l=-165597e-11,p=m/h,x=2/3;function g(o,t){for(var e=[31,o%4==0?29:28,31,30,31,30,31,31,30,31,30,31],s=Math.floor(t),a=1,n=0;s>n+e[a-1]&&a<12;)n+=e[a-1],a+=1;var d=a,r=s-n,i=24*(t-s),c=Math.floor(i);i=60*(i-c);var h=Math.floor(i);return{mon:d,day:r,hr:c,minute:h,sec:60*(i-h)}}function M(o,t,e,s,a,n){var d=arguments.length>6&&void 0!==arguments[6]?arguments[6]:0;return 367*o-Math.floor(7*(o+Math.floor((t+9)/12))*.25)+Math.floor(275*t/9)+e+1721013.5+((d/6e4+n/60+a)/60+s)/24}function f(o,t,e,s,a,n,d){if(o instanceof Date){var r=o;return M(r.getUTCFullYear(),r.getUTCMonth()+1,r.getUTCDate(),r.getUTCHours(),r.getUTCMinutes(),r.getUTCSeconds(),r.getUTCMilliseconds())}return M(o,t,e,s,a,n,d)}function u(e,s){var a,n,d,r,i,c,h,m,l,p,x,g,M,f,u,z,v,y,b=e.e3,q=e.ee2,w=e.peo,T=e.pgho,j=e.pho,E=e.pinco,F=e.plo,A=e.se2,C=e.se3,L=e.sgh2,S=e.sgh3,U=e.sgh4,D=e.sh2,I=e.sh3,R=e.si2,_=e.si3,k=e.sl2,O=e.sl3,P=e.sl4,Z=e.t,G=e.xgh2,H=e.xgh3,Y=e.xgh4,$=e.xh2,B=e.xh3,J=e.xi2,K=e.xi3,N=e.xl2,Q=e.xl3,V=e.xl4,W=e.zmol,X=e.zmos,oo=s.init,to=s.opsmode,eo=s.ep,so=s.inclp,ao=s.nodep,no=s.argpp,ro=s.mp;y=X+119459e-10*Z,"y"===oo&&(y=X),v=y+.0335*Math.sin(y);var io=A*(h=.5*(f=Math.sin(v))*f-.25)+C*(m=-.5*f*Math.cos(v)),co=R*h+_*m,ho=k*h+O*m+P*f,mo=L*h+S*m+U*f,lo=D*h+I*m;return y=W+.00015835218*Z,"y"===oo&&(y=W),v=y+.1098*Math.sin(y),l=io+(q*(h=.5*(f=Math.sin(v))*f-.25)+b*(m=-.5*f*Math.cos(v))),g=co+(J*h+K*m),M=ho+(N*h+Q*m+V*f),p=mo+(G*h+H*m+Y*f),x=lo+($*h+B*m),"n"===oo&&(M-=F,p-=T,x-=j,so+=g-=E,eo+=l-=w,r=Math.sin(so),d=Math.cos(so),so>=.2?(no+=p-=d*(x/=r),ao+=x,ro+=M):(a=r*(c=Math.sin(ao)),n=r*(i=Math.cos(ao)),a+=x*i+g*d*c,n+=-x*c+g*d*i,(ao%=t)<0&&"a"===to&&(ao+=t),u=ro+no+d*ao,u+=M+p-g*ao*r,z=ao,(ao=Math.atan2(a,n))<0&&"a"===to&&(ao+=t),Math.abs(z-ao)>o&&(ao<z?ao+=t:ao-=t),no=u-(ro+=M)-d*ao)),{ep:eo,inclp:so,nodep:ao,argpp:no,mp:ro}}function z(o){var s=(o-2451545)/36525,a=-62e-7*s*s*s+.093104*s*s+3164400184.812866*s+67310.54841;return(a=a*e/240%t)<0&&(a+=t),a}function v(){return(arguments.length<=0?void 0:arguments[0])instanceof Date||arguments.length>1?z(f.apply(void 0,arguments)):z.apply(void 0,arguments)}function y(e,s){var a,n,c,m,l,g,M,f,z,v,y,b,q,w,T,j,E,F,A,C,L,S,U,D,I,R;e.t=s,e.error=0;var _=e.mo+e.mdot*e.t,k=e.argpo+e.argpdot*e.t,O=e.nodeo+e.nodedot*e.t;f=k,C=_;var P=e.t*e.t;if(S=O+e.nodecf*P,j=1-e.cc1*e.t,E=e.bstar*e.cc4*e.t,F=e.t2cof*P,1!==e.isimp){g=e.omgcof*e.t;var Z=1+e.eta*Math.cos(_);C=_+(T=g+e.xmcof*(Z*Z*Z-e.delmo)),f=k-T,b=(y=P*e.t)*e.t,j=j-e.d2*P-e.d3*y-e.d4*b,E+=e.bstar*e.cc5*(Math.sin(C)-e.sinmao),F=F+e.t3cof*y+b*(e.t4cof+e.t*e.t5cof)}L=e.no;var G=e.ecco;if(A=e.inclo,"d"===e.method){q=e.t;var H=function(o){var e,s,a,n,d,r,i,c,h=o.irez,m=o.d2201,l=o.d2211,p=o.d3210,x=o.d3222,g=o.d4410,M=o.d4422,f=o.d5220,u=o.d5232,z=o.d5421,v=o.d5433,y=o.dedt,b=o.del1,q=o.del2,w=o.del3,T=o.didt,j=o.dmdt,E=o.dnodt,F=o.domdt,A=o.argpo,C=o.argpdot,L=o.t,S=o.tc,U=o.gsto,D=o.xfact,I=o.xlamo,R=o.no,_=o.atime,k=o.em,O=o.argpm,P=o.inclm,Z=o.xli,G=o.mm,H=o.xni,Y=o.nodem,$=o.nm,B=.13130908,J=2.8843198,K=.37448087,N=5.7686396,Q=.95240898,V=1.8014998,W=1.050833,X=4.4108898,oo=259200,to=0,eo=0,so=(U+.0043752690880113*S)%t;if(k+=y*L,P+=T*L,O+=F*L,Y+=E*L,G+=j*L,0!==h){(0===_||L*_<=0||Math.abs(L)<Math.abs(_))&&(_=0,H=R,Z=I),e=L>0?720:-720;for(var ao=381;381===ao;)2!==h?(i=b*Math.sin(Z-B)+q*Math.sin(2*(Z-J))+w*Math.sin(3*(Z-K)),d=H+D,r=b*Math.cos(Z-B)+2*q*Math.cos(2*(Z-J))+3*w*Math.cos(3*(Z-K)),r*=d):(a=(c=A+C*_)+c,s=Z+Z,i=m*Math.sin(a+Z-N)+l*Math.sin(Z-N)+p*Math.sin(c+Z-Q)+x*Math.sin(-c+Z-Q)+g*Math.sin(a+s-V)+M*Math.sin(s-V)+f*Math.sin(c+Z-W)+u*Math.sin(-c+Z-W)+z*Math.sin(c+s-X)+v*Math.sin(-c+s-X),d=H+D,r=m*Math.cos(a+Z-N)+l*Math.cos(Z-N)+p*Math.cos(c+Z-Q)+x*Math.cos(-c+Z-Q)+f*Math.cos(c+Z-W)+u*Math.cos(-c+Z-W)+2*(g*Math.cos(a+s-V)+M*Math.cos(s-V)+z*Math.cos(c+s-X)+v*Math.cos(-c+s-X)),r*=d),Math.abs(L-_)>=720?ao=381:(eo=L-_,ao=0),381===ao&&(Z+=d*e+i*oo,H+=i*e+r*oo,_+=e);$=H+i*eo+r*eo*eo*.5,n=Z+d*eo+i*eo*eo*.5,1!==h?(G=n-2*Y+2*so,to=$-R):(G=n-Y-O+so,to=$-R),$=R+to}return{atime:_,em:k,argpm:O,inclm:P,xli:Z,mm:G,xni:H,nodem:Y,dndt:to,nm:$}}({irez:e.irez,d2201:e.d2201,d2211:e.d2211,d3210:e.d3210,d3222:e.d3222,d4410:e.d4410,d4422:e.d4422,d5220:e.d5220,d5232:e.d5232,d5421:e.d5421,d5433:e.d5433,dedt:e.dedt,del1:e.del1,del2:e.del2,del3:e.del3,didt:e.didt,dmdt:e.dmdt,dnodt:e.dnodt,domdt:e.domdt,argpo:e.argpo,argpdot:e.argpdot,t:e.t,tc:q,gsto:e.gsto,xfact:e.xfact,xlamo:e.xlamo,no:e.no,atime:e.atime,em:G,argpm:f,inclm:A,xli:e.xli,mm:C,xni:e.xni,nodem:S,nm:L});G=H.em,f=H.argpm,A=H.inclm,C=H.mm,S=H.nodem,L=H.nm}if(L<=0)return e.error=2,[!1,!1];var Y=Math.pow(r/L,x)*j*j;if(L=r/Math.pow(Y,1.5),(G-=E)>=1||G<-.001)return e.error=1,[!1,!1];G<1e-6&&(G=1e-6),D=(C+=e.no*F)+f+S;var $=G;if(U=A,z=f%=t,R=S%=t,I=C=((D%=t)-f-S)%t,m=Math.sin(A),c=Math.cos(A),"d"===e.method){var B=u(e,{inclo:e.inclo,init:"n",ep:$,inclp:U,nodep:R,argpp:z,mp:I,opsmode:e.operationmode});if($=B.ep,R=B.nodep,z=B.argpp,I=B.mp,(U=B.inclp)<0&&(U=-U,R+=o,z-=o),$<0||$>1)return e.error=3,[!1,!1]}"d"===e.method&&(m=Math.sin(U),c=Math.cos(U),e.aycof=-.5*p*m,Math.abs(c+1)>15e-13?e.xlcof=-.25*p*m*(3+5*c)/(1+c):e.xlcof=-.25*p*m*(3+5*c)/15e-13);var J=$*Math.cos(z);T=1/(Y*(1-$*$));var K=$*Math.sin(z)+T*e.aycof,N=(I+z+R+T*e.xlcof*J-R)%t;M=N,w=9999.9;for(var Q=1;Math.abs(w)>=1e-12&&Q<=10;)n=Math.sin(M),w=(N-K*(a=Math.cos(M))+J*n-M)/(w=1-a*J-n*K),Math.abs(w)>=.95&&(w=w>0?.95:-.95),M+=w,Q+=1;var V=J*a+K*n,W=J*n-K*a,X=J*J+K*K,oo=Y*(1-X);if(oo<0)return e.error=4,[!1,!1];var to=Y*(1-V),eo=Math.sqrt(Y)*W/to,so=Math.sqrt(oo)/to,ao=Math.sqrt(1-X),no=Y/to*(n-K-J*(T=W/(1+ao))),ro=Y/to*(a-J+K*T);v=Math.atan2(no,ro);var io=(ro+ro)*no,co=1-2*no*no,ho=.5*h*(T=1/oo),mo=ho*T;"d"===e.method&&(l=c*c,e.con41=3*l-1,e.x1mth2=1-l,e.x7thm1=7*l-1);var lo=to*(1-1.5*mo*ao*e.con41)+.5*ho*e.x1mth2*co;if(lo<1)return e.error=6,{position:!1,velocity:!1};v-=.25*mo*e.x7thm1*io;var po=R+1.5*mo*c*io,xo=U+1.5*mo*c*m*co,go=eo-L*ho*e.x1mth2*io/r,Mo=so+L*ho*(e.x1mth2*co+1.5*e.con41)/r,fo=Math.sin(v),uo=Math.cos(v),zo=Math.sin(po),vo=Math.cos(po),yo=Math.sin(xo),bo=Math.cos(xo),qo=-zo*bo,wo=vo*bo,To=qo*fo+vo*uo,jo=wo*fo+zo*uo,Eo=yo*fo;return{position:{x:lo*To*d,y:lo*jo*d,z:lo*Eo*d},velocity:{x:(go*To+Mo*(qo*uo-vo*fo))*i,y:(go*jo+Mo*(wo*uo-zo*fo))*i,z:(go*Eo+Mo*(yo*uo))*i}}}function b(e,s){var a,n,i,m,g,M,f,z,b,q,w,T,j,E,F,A,C,L,S,U,D,I,R,_,k,O,P,Z,G,H,Y,$,B,J,K,N,Q,V,W,X,oo,to,eo,so,ao,no,ro,io,co,ho,mo,lo,po=s.opsmode,xo=s.satn,go=s.epoch,Mo=s.xbstar,fo=s.xecco,uo=s.xargpo,zo=s.xinclo,vo=s.xmo,yo=s.xno,bo=s.xnodeo;e.isimp=0,e.method="n",e.aycof=0,e.con41=0,e.cc1=0,e.cc4=0,e.cc5=0,e.d2=0,e.d3=0,e.d4=0,e.delmo=0,e.eta=0,e.argpdot=0,e.omgcof=0,e.sinmao=0,e.t=0,e.t2cof=0,e.t3cof=0,e.t4cof=0,e.t5cof=0,e.x1mth2=0,e.x7thm1=0,e.mdot=0,e.nodedot=0,e.xlcof=0,e.xmcof=0,e.nodecf=0,e.irez=0,e.d2201=0,e.d2211=0,e.d3210=0,e.d3222=0,e.d4410=0,e.d4422=0,e.d5220=0,e.d5232=0,e.d5421=0,e.d5433=0,e.dedt=0,e.del1=0,e.del2=0,e.del3=0,e.didt=0,e.dmdt=0,e.dnodt=0,e.domdt=0,e.e3=0,e.ee2=0,e.peo=0,e.pgho=0,e.pho=0,e.pinco=0,e.plo=0,e.se2=0,e.se3=0,e.sgh2=0,e.sgh3=0,e.sgh4=0,e.sh2=0,e.sh3=0,e.si2=0,e.si3=0,e.sl2=0,e.sl3=0,e.sl4=0,e.gsto=0,e.xfact=0,e.xgh2=0,e.xgh3=0,e.xgh4=0,e.xh2=0,e.xh3=0,e.xi2=0,e.xi3=0,e.xl2=0,e.xl3=0,e.xl4=0,e.xlamo=0,e.zmol=0,e.zmos=0,e.atime=0,e.xli=0,e.xni=0,e.bstar=Mo,e.ecco=fo,e.argpo=uo,e.inclo=zo,e.mo=vo,e.no=yo,e.nodeo=bo,e.operationmode=po;e.init="y",e.t=0;var qo=function(o){var e=o.ecco,s=o.epoch,a=o.inclo,n=o.opsmode,d=o.no,i=e*e,c=1-i,m=Math.sqrt(c),l=Math.cos(a),p=l*l,g=Math.pow(r/d,x),M=.75*h*(3*p-1)/(m*c),f=M/(g*g),u=g*(1-f*f-f*(1/3+134*f*f/81));d/=1+(f=M/(u*u));var z,y=Math.pow(r/d,x),b=Math.sin(a),q=y*c,w=1-5*p,T=-w-p-p,j=1/y,E=q*q,F=y*(1-e);if("a"===n){var A=s-7305,C=Math.floor(A+1e-8),L=.017202791694070362;(z=(1.7321343856509375+L*C+(L+t)*(A-C)+A*A*5075514194322695e-30)%t)<0&&(z+=t)}else z=v(s+2433281.5);return{no:d,method:"n",ainv:j,ao:y,con41:T,con42:w,cosio:l,cosio2:p,eccsq:i,omeosq:c,posq:E,rp:F,rteosq:m,sinio:b,gsto:z}}({satn:xo,ecco:e.ecco,epoch:go,inclo:e.inclo,no:e.no,method:e.method,opsmode:e.operationmode}),wo=qo.ao,To=qo.con42,jo=qo.cosio,Eo=qo.cosio2,Fo=qo.eccsq,Ao=qo.omeosq,Co=qo.posq,Lo=qo.rp,So=qo.rteosq,Uo=qo.sinio;if(e.no=qo.no,e.con41=qo.con41,e.gsto=qo.gsto,e.a=Math.pow(e.no*c,-2/3),e.alta=e.a*(1+e.ecco)-1,e.altp=e.a*(1-e.ecco)-1,e.error=0,Ao>=0||e.no>=0){if(e.isimp=0,Lo<1.034492841559484&&(e.isimp=1),_=1.0122292801892716,L=1.880279159015271e-9,(F=(Lo-1)*d)<156){_=F-78,F<98&&(_=20);var Do=(120-_)/d;L=Do*Do*Do*Do,_=_/d+1}A=1/Co,to=1/(wo-_),e.eta=wo*e.ecco*to,T=e.eta*e.eta,w=e.ecco*e.eta,C=Math.abs(1-T),m=(f=(M=L*Math.pow(to,4))/Math.pow(C,3.5))*e.no*(wo*(1+1.5*T+w*(4+T))+.375*h*to/C*e.con41*(8+3*T*(8+T))),e.cc1=e.bstar*m,g=0,e.ecco>1e-4&&(g=-2*M*to*p*e.no*Uo/e.ecco),e.x1mth2=1-Eo,e.cc4=2*e.no*f*wo*Ao*(e.eta*(2+.5*T)+e.ecco*(.5+2*T)-h*to/(wo*C)*(-3*e.con41*(1-2*w+T*(1.5-.5*w))+.75*e.x1mth2*(2*T-w*(1+T))*Math.cos(2*e.argpo))),e.cc5=2*f*wo*Ao*(1+2.75*(T+w)+w*T),z=Eo*Eo,X=.5*(W=1.5*h*A*e.no)*h*A,oo=-.46875*l*A*A*e.no,e.mdot=e.no+.5*W*So*e.con41+.0625*X*So*(13-78*Eo+137*z),e.argpdot=-.5*W*To+.0625*X*(7-114*Eo+395*z)+oo*(3-36*Eo+49*z),so=-W*jo,e.nodedot=so+(.5*X*(4-19*Eo)+2*oo*(3-7*Eo))*jo,eo=e.argpdot+e.nodedot,e.omgcof=e.bstar*g*Math.cos(e.argpo),e.xmcof=0,e.ecco>1e-4&&(e.xmcof=-x*M*e.bstar/w),e.nodecf=3.5*Ao*so*e.cc1,e.t2cof=1.5*e.cc1,Math.abs(jo+1)>15e-13?e.xlcof=-.25*p*Uo*(3+5*jo)/(1+jo):e.xlcof=-.25*p*Uo*(3+5*jo)/15e-13,e.aycof=-.5*p*Uo;var Io=1+e.eta*Math.cos(e.mo);if(e.delmo=Io*Io*Io,e.sinmao=Math.sin(e.mo),e.x7thm1=7*Eo-1,2*o/e.no>=225){e.method="d",e.isimp=1,0,j=e.inclo;var Ro=function(o){var e,s,a,n,d,r,i,c,h,m,l,p,x,g,M,f,u,z,v,y,b,q,w,T,j,E,F,A,C,L,S,U,D,I,R,_,k,O,P,Z,G,H,Y,$,B,J,K,N,Q,V,W,X,oo,to,eo,so,ao,no,ro,io,co,ho,mo,lo=o.epoch,po=o.ep,xo=o.argpp,go=o.tc,Mo=o.inclp,fo=o.nodep,uo=.01675,zo=.0549,vo=o.np,yo=po,bo=Math.sin(fo),qo=Math.cos(fo),wo=Math.sin(xo),To=Math.cos(xo),jo=Math.sin(Mo),Eo=Math.cos(Mo),Fo=yo*yo,Ao=1-Fo,Co=Math.sqrt(Ao),Lo=lo+18261.5+go/1440,So=(4.523602-.00092422029*Lo)%t,Uo=Math.sin(So),Do=Math.cos(So),Io=.91375164-.03568096*Do,Ro=Math.sqrt(1-Io*Io),_o=.089683511*Uo/Ro,ko=Math.sqrt(1-_o*_o),Oo=5.8351514+.001944368*Lo,Po=.39785416*Uo/Ro,Zo=ko*Do+.91744867*_o*Uo;Po=Math.atan2(Po,Zo),Po+=Oo-So;var Go=Math.cos(Po),Ho=Math.sin(Po);y=.1945905,b=-.98088458,T=.91744867,j=.39785416,q=qo,w=bo,l=29864797e-13;for(var Yo=1/vo,$o=0;$o<2;)eo=-6*(e=y*q+b*T*w)*(d=-jo*(i=-y*w+b*T*q)+Eo*(c=b*j))+Fo*(-24*(p=e*To+(s=Eo*i+jo*c)*wo)*(z=d*To)-6*(g=-e*wo+s*To)*(f=d*wo)),so=-6*(e*(r=-jo*(h=b*w+y*T*q)+Eo*(m=y*j))+(a=-b*q+y*T*w)*d)+Fo*(-24*((x=a*To+(n=Eo*h+jo*m)*wo)*z+p*(v=r*To))+-6*(g*(u=r*wo)+(M=-a*wo+n*To)*f)),ao=-6*a*r+Fo*(-24*x*v-6*M*u),no=6*s*d+Fo*(24*p*f-6*g*z),ro=6*(n*d+s*r)+Fo*(24*(x*f+p*u)-6*(M*z+g*v)),io=6*n*r+Fo*(24*x*u-6*M*v),X=(X=3*(e*e+s*s)+(co=12*p*p-3*g*g)*Fo)+X+Ao*co,oo=(oo=6*(e*a+s*n)+(ho=24*p*x-6*g*M)*Fo)+oo+Ao*ho,to=(to=3*(a*a+n*n)+(mo=12*x*x-3*M*M)*Fo)+to+Ao*mo,J=-.5*(K=l*Yo)/Co,B=-15*yo*(N=K*Co),Q=p*g+x*M,V=x*g+p*M,W=x*M-p*g,1===($o+=1)&&(E=B,F=J,A=K,C=N,L=Q,S=V,U=W,D=X,I=oo,R=to,_=eo,k=so,O=ao,P=no,Z=ro,G=io,H=co,Y=ho,$=mo,y=Go,b=Ho,T=Io,j=Ro,q=ko*qo+_o*bo,w=bo*ko-qo*_o,l=4.7968065e-7);return{snodm:bo,cnodm:qo,sinim:jo,cosim:Eo,sinomm:wo,cosomm:To,day:Lo,e3:2*B*W,ee2:2*B*V,em:yo,emsq:Fo,gam:Oo,peo:0,pgho:0,pho:0,pinco:0,plo:0,rtemsq:Co,se2:2*E*S,se3:2*E*U,sgh2:2*C*Y,sgh3:2*C*($-H),sgh4:-18*C*uo,sh2:-2*F*Z,sh3:-2*F*(G-P),si2:2*F*k,si3:2*F*(O-_),sl2:-2*A*I,sl3:-2*A*(R-D),sl4:-2*A*(-21-9*Fo)*uo,s1:B,s2:J,s3:K,s4:N,s5:Q,s6:V,s7:W,ss1:E,ss2:F,ss3:A,ss4:C,ss5:L,ss6:S,ss7:U,sz1:D,sz2:I,sz3:R,sz11:_,sz12:k,sz13:O,sz21:P,sz22:Z,sz23:G,sz31:H,sz32:Y,sz33:$,xgh2:2*N*ho,xgh3:2*N*(mo-co),xgh4:-18*N*zo,xh2:-2*J*ro,xh3:-2*J*(io-no),xi2:2*J*so,xi3:2*J*(ao-eo),xl2:-2*K*oo,xl3:-2*K*(to-X),xl4:-2*K*(-21-9*Fo)*zo,nm:vo,z1:X,z2:oo,z3:to,z11:eo,z12:so,z13:ao,z21:no,z22:ro,z23:io,z31:co,z32:ho,z33:mo,zmol:(.2299715*Lo-Oo+4.7199672)%t,zmos:(6.2565837+.017201977*Lo)%t}}({epoch:go,ep:e.ecco,argpp:e.argpo,tc:0,inclp:e.inclo,nodep:e.nodeo,np:e.no,e3:e.e3,ee2:e.ee2,peo:e.peo,pgho:e.pgho,pho:e.pho,pinco:e.pinco,plo:e.plo,se2:e.se2,se3:e.se3,sgh2:e.sgh2,sgh3:e.sgh3,sgh4:e.sgh4,sh2:e.sh2,sh3:e.sh3,si2:e.si2,si3:e.si3,sl2:e.sl2,sl3:e.sl3,sl4:e.sl4,xgh2:e.xgh2,xgh3:e.xgh3,xgh4:e.xgh4,xh2:e.xh2,xh3:e.xh3,xi2:e.xi2,xi3:e.xi3,xl2:e.xl2,xl3:e.xl3,xl4:e.xl4,zmol:e.zmol,zmos:e.zmos});e.e3=Ro.e3,e.ee2=Ro.ee2,e.peo=Ro.peo,e.pgho=Ro.pgho,e.pho=Ro.pho,e.pinco=Ro.pinco,e.plo=Ro.plo,e.se2=Ro.se2,e.se3=Ro.se3,e.sgh2=Ro.sgh2,e.sgh3=Ro.sgh3,e.sgh4=Ro.sgh4,e.sh2=Ro.sh2,e.sh3=Ro.sh3,e.si2=Ro.si2,e.si3=Ro.si3,e.sl2=Ro.sl2,e.sl3=Ro.sl3,e.sl4=Ro.sl4,n=Ro.sinim,a=Ro.cosim,b=Ro.em,q=Ro.emsq,S=Ro.s1,U=Ro.s2,D=Ro.s3,I=Ro.s4,R=Ro.s5,k=Ro.ss1,O=Ro.ss2,P=Ro.ss3,Z=Ro.ss4,G=Ro.ss5,H=Ro.sz1,Y=Ro.sz3,$=Ro.sz11,B=Ro.sz13,J=Ro.sz21,K=Ro.sz23,N=Ro.sz31,Q=Ro.sz33,e.xgh2=Ro.xgh2,e.xgh3=Ro.xgh3,e.xgh4=Ro.xgh4,e.xh2=Ro.xh2,e.xh3=Ro.xh3,e.xi2=Ro.xi2,e.xi3=Ro.xi3,e.xl2=Ro.xl2,e.xl3=Ro.xl3,e.xl4=Ro.xl4,e.zmol=Ro.zmol,e.zmos=Ro.zmos,E=Ro.nm,ao=Ro.z1,no=Ro.z3,ro=Ro.z11,io=Ro.z13,co=Ro.z21,ho=Ro.z23,mo=Ro.z31,lo=Ro.z33;var _o=u(e,{inclo:j,init:e.init,ep:e.ecco,inclp:e.inclo,nodep:e.nodeo,argpp:e.argpo,mp:e.mo,opsmode:e.operationmode});e.ecco=_o.ep,e.inclo=_o.inclp,e.nodeo=_o.nodep,e.argpo=_o.argpp,e.mo=_o.mp,0,0,0;var ko=function(e){var s,a,n,d,i,c,h,m,l,p,g,M,f,u,z,v,y,b=e.cosim,q=e.argpo,w=e.s1,T=e.s2,j=e.s3,E=e.s4,F=e.s5,A=e.sinim,C=e.ss1,L=e.ss2,S=e.ss3,U=e.ss4,D=e.ss5,I=e.sz1,R=e.sz3,_=e.sz11,k=e.sz13,O=e.sz21,P=e.sz23,Z=e.sz31,G=e.sz33,H=e.t,Y=e.tc,$=e.gsto,B=e.mo,J=e.mdot,K=e.no,N=e.nodeo,Q=e.nodedot,V=e.xpidot,W=e.z1,X=e.z3,oo=e.z11,to=e.z13,eo=e.z21,so=e.z23,ao=e.z31,no=e.z33,ro=e.ecco,io=e.eccsq,co=e.emsq,ho=e.em,mo=e.argpm,lo=e.inclm,po=e.mm,xo=e.nm,go=e.nodem,Mo=e.irez,fo=e.atime,uo=e.d2201,zo=e.d2211,vo=e.d3210,yo=e.d3222,bo=e.d4410,qo=e.d4422,wo=e.d5220,To=e.d5232,jo=e.d5421,Eo=e.d5433,Fo=e.dedt,Ao=e.didt,Co=e.dmdt,Lo=e.dnodt,So=e.domdt,Uo=e.del1,Do=e.del2,Io=e.del3,Ro=e.xfact,_o=e.xlamo,ko=e.xli,Oo=e.xni,Po=.0043752690880113,Zo=.00015835218,Go=119459e-10;Mo=0,xo<.0052359877&&xo>.0034906585&&(Mo=1),xo>=.00826&&xo<=.00924&&ho>=.5&&(Mo=2);var Ho=-Go*L*(O+P);(lo<.052359877||lo>o-.052359877)&&(Ho=0),0!==A&&(Ho/=A);var Yo=-Zo*T*(eo+so);(lo<.052359877||lo>o-.052359877)&&(Yo=0),So=U*Go*(Z+G-6)-b*Ho+E*Zo*(ao+no-6),Lo=Ho,0!==A&&(So-=b/A*Yo,Lo+=Yo/A);var $o=($+Y*Po)%t;if(ho+=(Fo=C*Go*D+w*Zo*F)*H,lo+=(Ao=L*Go*(_+k)+T*Zo*(oo+to))*H,mo+=So*H,go+=Lo*H,po+=(Co=-Go*S*(I+R-14-6*co)-Zo*j*(W+X-14-6*co))*H,0!==Mo){if(z=Math.pow(xo/r,x),2===Mo){var Bo=ho,Jo=co;y=(ho=ro)*(co=io),ho<=.65?(n=3.616-13.247*ho+16.29*co,d=117.39*ho-19.302-228.419*co+156.591*y,i=109.7927*ho-18.9068-214.6334*co+146.5816*y,c=242.694*ho-41.122-471.094*co+313.953*y,h=841.88*ho-146.407-1629.014*co+1083.435*y,m=3017.977*ho-532.114-5740.032*co+3708.276*y):(n=331.819*ho-72.099-508.738*co+266.724*y,d=1582.851*ho-346.844-2415.925*co+1246.113*y,i=1554.908*ho-342.585-2366.899*co+1215.972*y,c=4758.686*ho-1052.797-7193.992*co+3651.957*y,h=16178.11*ho-3581.69-24462.77*co+12422.52*y,m=ho>.715?29936.92*ho-5149.66-54087.36*co+31324.56*y:1464.74-4664.75*ho+3763.64*co),ho<.7?(g=4988.61*ho-919.2277-9064.77*co+5542.21*y,l=4568.6173*ho-822.71072-8491.4146*co+5337.524*y,p=4690.25*ho-853.666-8624.77*co+5341.4*y):(g=161616.52*ho-37995.78-229838.2*co+109377.94*y,l=218913.95*ho-51752.104-309468.16*co+146349.42*y,p=170470.89*ho-40023.88-242699.48*co+115605.82*y),uo=(f=17891679e-13*(u=xo*xo*3*(z*z)))*(s=.75*(1+2*b+(v=b*b)))*(-.306-.44*(ho-.64)),zo=f*(1.5*(M=A*A))*n,vo=(f=3.7393792e-7*(u*=z))*(1.875*A*(1-2*b-3*v))*d,yo=f*(-1.875*A*(1+2*b-3*v))*i,bo=(f=2*(u*=z)*7.3636953e-9)*(35*M*s)*c,qo=f*(39.375*M*M)*h,wo=(f=1.1428639e-7*(u*=z))*(9.84375*A*(M*(1-2*b-5*v)+.33333333*(4*b-2+6*v)))*m,To=f*(A*(4.92187512*M*(-2-4*b+10*v)+6.56250012*(1+2*b-3*v)))*p,jo=(f=2*u*2.1765803e-9)*(29.53125*A*(2-8*b+v*(8*b-12+10*v)))*l,Eo=f*(29.53125*A*(-2-8*b+v*(12+8*b-10*v)))*g,_o=(B+N+N-($o+$o))%t,Ro=J+Co+2*(Q+Lo-Po)-K,ho=Bo,co=Jo}1===Mo&&(a=1+b,Do=2*(Uo=3*xo*xo*z*z)*(s=.75*(1+b)*(1+b))*(1+co*(.8125*co-2.5))*17891679e-13,Io=3*Uo*(a*=1.875*a*a)*(1+co*(6.60937*co-6))*2.2123015e-7*z,Uo=Uo*(.9375*A*A*(1+3*b)-.75*(1+b))*(d=1+2*co)*21460748e-13*z,_o=(B+N+q-$o)%t,Ro=J+V+Co+So+Lo-(K+Po)),ko=_o,Oo=K,fo=0,xo=K+0}return{em:ho,argpm:mo,inclm:lo,mm:po,nm:xo,nodem:go,irez:Mo,atime:fo,d2201:uo,d2211:zo,d3210:vo,d3222:yo,d4410:bo,d4422:qo,d5220:wo,d5232:To,d5421:jo,d5433:Eo,dedt:Fo,didt:Ao,dmdt:Co,dndt:0,dnodt:Lo,domdt:So,del1:Uo,del2:Do,del3:Io,xfact:Ro,xlamo:_o,xli:ko,xni:Oo}}({cosim:a,emsq:q,argpo:e.argpo,s1:S,s2:U,s3:D,s4:I,s5:R,sinim:n,ss1:k,ss2:O,ss3:P,ss4:Z,ss5:G,sz1:H,sz3:Y,sz11:$,sz13:B,sz21:J,sz23:K,sz31:N,sz33:Q,t:e.t,tc:0,gsto:e.gsto,mo:e.mo,mdot:e.mdot,no:e.no,nodeo:e.nodeo,nodedot:e.nodedot,xpidot:eo,z1:ao,z3:no,z11:ro,z13:io,z21:co,z23:ho,z31:mo,z33:lo,ecco:e.ecco,eccsq:Fo,em:b,argpm:0,inclm:j,mm:0,nm:E,nodem:0,irez:e.irez,atime:e.atime,d2201:e.d2201,d2211:e.d2211,d3210:e.d3210,d3222:e.d3222,d4410:e.d4410,d4422:e.d4422,d5220:e.d5220,d5232:e.d5232,d5421:e.d5421,d5433:e.d5433,dedt:e.dedt,didt:e.didt,dmdt:e.dmdt,dnodt:e.dnodt,domdt:e.domdt,del1:e.del1,del2:e.del2,del3:e.del3,xfact:e.xfact,xlamo:e.xlamo,xli:e.xli,xni:e.xni});e.irez=ko.irez,e.atime=ko.atime,e.d2201=ko.d2201,e.d2211=ko.d2211,e.d3210=ko.d3210,e.d3222=ko.d3222,e.d4410=ko.d4410,e.d4422=ko.d4422,e.d5220=ko.d5220,e.d5232=ko.d5232,e.d5421=ko.d5421,e.d5433=ko.d5433,e.dedt=ko.dedt,e.didt=ko.didt,e.dmdt=ko.dmdt,e.dnodt=ko.dnodt,e.domdt=ko.domdt,e.del1=ko.del1,e.del2=ko.del2,e.del3=ko.del3,e.xfact=ko.xfact,e.xlamo=ko.xlamo,e.xli=ko.xli,e.xni=ko.xni}1!==e.isimp&&(i=e.cc1*e.cc1,e.d2=4*wo*to*i,V=e.d2*to*e.cc1/3,e.d3=(17*wo+_)*V,e.d4=.5*V*wo*to*(221*wo+31*_)*e.cc1,e.t3cof=e.d2+2*i,e.t4cof=.25*(3*e.d3+e.cc1*(12*e.d2+10*i)),e.t5cof=.2*(3*e.d4+12*e.cc1*e.d3+6*e.d2*e.d2+15*i*(2*e.d2+i)))}y(e,0),e.init="n"}function q(o){return function(o){if(Array.isArray(o))return w(o)}(o)||function(o){if("undefined"!=typeof Symbol&&null!=o[Symbol.iterator]||null!=o["@@iterator"])return Array.from(o)}(o)||function(o,t){if(!o)return;if("string"==typeof o)return w(o,t);var e=Object.prototype.toString.call(o).slice(8,-1);"Object"===e&&o.constructor&&(e=o.constructor.name);if("Map"===e||"Set"===e)return Array.from(o);if("Arguments"===e||/^(?:Ui|I)nt(?:8|16|32)(?:Clamped)?Array$/.test(e))return w(o,t)}(o)||function(){throw new TypeError("Invalid attempt to spread non-iterable instance.\nIn order to be iterable, non-array objects must have a [Symbol.iterator]() method.")}()}function w(o,t){(null==t||t>o.length)&&(t=o.length);for(var e=0,s=new Array(t);e<t;e++)s[e]=o[e];return s}function T(o){return o*s}function j(o){return o*e}function E(o){var t=o.longitude,e=o.latitude,s=o.height,a=6378.137,n=(a-6356.7523142)/a,d=2*n-n*n,r=a/Math.sqrt(1-d*(Math.sin(e)*Math.sin(e)));return{x:(r+s)*Math.cos(e)*Math.cos(t),y:(r+s)*Math.cos(e)*Math.sin(t),z:(r*(1-d)+s)*Math.sin(e)}}var F={constants:Object.freeze({__proto__:null,deg2rad:e,earthRadius:d,j2:h,j3:m,j3oj2:p,j4:l,minutesPerDay:a,mu:n,pi:o,rad2deg:s,tumin:c,twoPi:t,vkmpersec:i,x2o3:x,xke:r}),propagate:function(){for(var o=arguments.length,t=new Array(o),e=0;e<o;e++)t[e]=arguments[e];var s=t[0],n=Array.prototype.slice.call(t,1),d=f.apply(void 0,q(n)),r=(d-s.jdsatepoch)*a;return y(s,r)},sgp4:y,twoline2satrec:function(t,s){var a=1440/(2*o),n=0,d={error:0};d.satnum=t.substring(2,7),d.epochyr=parseInt(t.substring(18,20),10),d.epochdays=parseFloat(t.substring(20,32)),d.ndot=parseFloat(t.substring(33,43)),d.nddot=parseFloat(".".concat(parseInt(t.substring(44,50),10),"E").concat(t.substring(50,52))),d.bstar=parseFloat("".concat(t.substring(53,54),".").concat(parseInt(t.substring(54,59),10),"E").concat(t.substring(59,61))),d.inclo=parseFloat(s.substring(8,16)),d.nodeo=parseFloat(s.substring(17,25)),d.ecco=parseFloat(".".concat(s.substring(26,33))),d.argpo=parseFloat(s.substring(34,42)),d.mo=parseFloat(s.substring(43,51)),d.no=parseFloat(s.substring(52,63)),d.no/=a,d.inclo*=e,d.nodeo*=e,d.argpo*=e,d.mo*=e;var r=g(n=d.epochyr<57?d.epochyr+2e3:d.epochyr+1900,d.epochdays),i=r.mon,c=r.day,h=r.hr,m=r.minute,l=r.sec;return d.jdsatepoch=f(n,i,c,h,m,l),b(d,{opsmode:"i",satn:d.satnum,epoch:d.jdsatepoch-2433281.5,xbstar:d.bstar,xecco:d.ecco,xargpo:d.argpo,xinclo:d.inclo,xmo:d.mo,xno:d.no,xnodeo:d.nodeo}),d},gstime:v,jday:f,invjday:function(o,t){var e=o-2415019.5,s=e/365.25,a=1900+Math.floor(s),n=Math.floor(.25*(a-1901)),d=e-(365*(a-1900)+n)+1e-11;d<1&&(d=e-(365*((a-=1)-1900)+(n=Math.floor(.25*(a-1901)))));var r=g(a,d),i=r.mon,c=r.day,h=r.hr,m=r.minute,l=r.sec-864e-9;return t?[a,i,c,h,m,Math.floor(l)]:new Date(Date.UTC(a,i-1,c,h,m,Math.floor(l)))},dopplerFactor:function(o,t,e){var s=7292115e-11,a={x:t.x-o.x,y:t.y-o.y,z:t.z-o.z};a.w=Math.sqrt(Math.pow(a.x,2)+Math.pow(a.y,2)+Math.pow(a.z,2));var n=e.x+s*o.y,d=e.y-s*o.x,r=e.z,i=(a.x*n+a.y*d+a.z*r)/a.w;return 1+i/299792.458*(i>=0?1:-1)},radiansToDegrees:T,degreesToRadians:j,degreesLat:function(t){if(t<-o/2||t>o/2)throw new RangeError("Latitude radians must be in range [-pi/2; pi/2].");return T(t)},degreesLong:function(t){if(t<-o||t>o)throw new RangeError("Longitude radians must be in range [-pi; pi].");return T(t)},radiansLat:function(o){if(o<-90||o>90)throw new RangeError("Latitude degrees must be in range [-90; 90].");return j(o)},radiansLong:function(o){if(o<-180||o>180)throw new RangeError("Longitude degrees must be in range [-180; 180].");return j(o)},geodeticToEcf:E,eciToGeodetic:function(e,s){for(var a=6378.137,n=Math.sqrt(e.x*e.x+e.y*e.y),d=(a-6356.7523142)/a,r=2*d-d*d,i=Math.atan2(e.y,e.x)-s;i<-o;)i+=t;for(;i>o;)i-=t;for(var c,h=0,m=Math.atan2(e.z,Math.sqrt(e.x*e.x+e.y*e.y));h<20;)c=1/Math.sqrt(1-r*(Math.sin(m)*Math.sin(m))),m=Math.atan2(e.z+a*c*r*Math.sin(m),n),h+=1;return{longitude:i,latitude:m,height:n/Math.cos(m)-a*c}},eciToEcf:function(o,t){return{x:o.x*Math.cos(t)+o.y*Math.sin(t),y:o.x*-Math.sin(t)+o.y*Math.cos(t),z:o.z}},ecfToEci:function(o,t){return{x:o.x*Math.cos(t)-o.y*Math.sin(t),y:o.x*Math.sin(t)+o.y*Math.cos(t),z:o.z}},ecfToLookAngles:function(t,e){var s,a,n,d,r,i,c=function(o,t){var e=o.longitude,s=o.latitude,a=E(o),n=t.x-a.x,d=t.y-a.y,r=t.z-a.z;return{topS:Math.sin(s)*Math.cos(e)*n+Math.sin(s)*Math.sin(e)*d-Math.cos(s)*r,topE:-Math.sin(e)*n+Math.cos(e)*d,topZ:Math.cos(s)*Math.cos(e)*n+Math.cos(s)*Math.sin(e)*d+Math.sin(s)*r}}(t,e);return a=(s=c).topS,n=s.topE,d=s.topZ,r=Math.sqrt(a*a+n*n+d*d),i=Math.asin(d/r),{azimuth:Math.atan2(-n,a)+o,elevation:i,rangeSat:r}}};return F}));
+
+</script>
+
+<script>
+const $ = s => document.querySelector(s);
+const state = {
+  run: null, idx: 0, playing: false, timer: null,
+  home: null, homeManual: null, zoom: 8, sats: {}, rain: null,
+  satAt: null, rainAt: null, pickMode: false,
+};
+
+// サーバー(--viewer)経由か、HTMLを直接開いた単体モードか
+const SERVER_MODE = location.protocol === "http:" || location.protocol === "https:";
+
+// ---------- data loading ----------
+async function api(path, params) {
+  const q = new URLSearchParams(params || {}).toString();
+  const r = await fetch(path + (q ? "?" + q : ""));
+  const j = await r.json();
+  if (j.error) throw new Error(j.error);
+  return j;
+}
+
+async function loadRun(path) {
+  setStatus("読み込み中…");
+  try {
+    applyRun(await api("/api/load", { path, step: $("#step").value }));
+  } catch (e) { setStatus("エラー: " + e.message); }
+}
+
+function applyRun(run) {
+  state.run = run;
+  state.idx = 0;
+  state.home = run.home;
+  $("#srcName").textContent = run.label + "(" + run.times.length + " サンプル)";
+  $("#timeline").max = Math.max(0, run.times.length - 1);
+  $("#timeline").value = 0;
+  $("#timeline").disabled = false;
+  $("#play").disabled = false;
+  state.zoom = autoZoom(run);
+  state.sats = {}; state.rain = null; state.satAt = null; state.rainAt = null;
+  const src = run.sources.map(s => s.file).join(", ");
+  setStatus("読み込み完了: " + src +
+    (run.meta && run.meta.tool_version ? " / " + run.meta.tool_version : ""));
+  render(true);
+}
+
+function setStatus(t) { $("#status").textContent = t; }
+
+// ---- 単体モード: 選択されたCSVをブラウザ内で解析 ----
+async function readTextFile(file) {
+  if (file.name.endsWith(".gz")) {
+    if (!("DecompressionStream" in window))
+      throw new Error(".gz を開くには新しいブラウザが必要です(展開して選び直してください)");
+    const ds = new DecompressionStream("gzip");
+    return await new Response(file.stream().pipeThrough(ds)).text();
+  }
+  return await file.text();
+}
+function parseCSV(text) {
+  const rows = []; let row = [], field = "", quoted = false;
+  for (let i = 0; i < text.length; i++) {
+    const c = text[i];
+    if (quoted) {
+      if (c === '"') { if (text[i + 1] === '"') { field += '"'; i++; } else quoted = false; }
+      else field += c;
+    } else if (c === '"') quoted = true;
+    else if (c === ",") { row.push(field); field = ""; }
+    else if (c === "\n") { row.push(field); field = ""; rows.push(row); row = []; }
+    else if (c !== "\r") field += c;
+  }
+  if (field || row.length) { row.push(field); rows.push(row); }
+  if (!rows.length) return [];
+  const head = rows.shift();
+  return rows.filter(r => r.length > 1).map(r =>
+    Object.fromEntries(head.map((h, i) => [h, r[i]])));
+}
+const RX = {
+  down_mbps: [/^mbps_down$/i, /downlink_throughput_bps$/i],
+  up_mbps: [/^mbps_up$/i, /uplink_throughput_bps$/i],
+  rtt_ms: [/^latency_ms$/i, /pop_ping_latency_ms$/i],
+  loss: [/pop_ping_drop_rate$/i],
+  snr_db: [/sinr[_ ]?db$/i, /\bsinr$/i, /snr_db$/i],
+  speed: [/position\.speed$/i],
+  kymeta_az: [/look-angle\.azimuth$/i], kymeta_el: [/look-angle\.elevation$/i],
+  starlink_az: [/boresight_azimuth_deg$/i], starlink_el: [/boresight_elevation_deg$/i],
+  lat: [/position\.latitude$/i, /\blatitude$/i], lon: [/position\.longitude$/i, /\blongitude$/i],
+};
+const numOf = v => {
+  if (v === "" || v == null) return null;
+  if (v === "True" || v === "true") return 1; if (v === "False" || v === "false") return 0;
+  const f = parseFloat(v); return Number.isFinite(f) ? f : null;
+};
+async function loadFiles(files) {
+  files = files.filter(f => /\.csv(\.gz)?$/i.test(f.name));
+  if (!files.length) { setStatus("CSVが見つかりませんでした"); return; }
+  setStatus("読み込み中… (" + files.length + " ファイル)");
+  const samples = new Map(), used = [];
+  for (const file of files) {
+    let rows;
+    try { rows = parseCSV(await readTextFile(file)); }
+    catch (e) { setStatus(file.name + ": " + e.message); continue; }
+    if (!rows.length || !("epoch" in rows[0])) continue;
+    const cols = Object.keys(rows[0]);
+    const pick = {};
+    for (const [key, pats] of Object.entries(RX)) {
+      const col = cols.find(c => pats.some(rx => rx.test(c)));
+      if (col) pick[key] = col;
+    }
+    used.push(file.name);
+    for (const r of rows) {
+      const t = Math.round(numOf(r.epoch)); if (!Number.isFinite(t)) continue;
+      const slot = samples.get(t) || samples.set(t, {}).get(t);
+      for (const [key, col] of Object.entries(pick)) {
+        let v = numOf(r[col]); if (v == null) continue;
+        if (/_bps$/.test(col)) v /= 1e6;
+        slot[key] = v;
+      }
+      if (r.phase) slot.phase = r.phase;
+    }
+  }
+  if (!samples.size) { setStatus("epoch列を持つCSVがありませんでした"); return; }
+  let times = [...samples.keys()].sort((a, b) => a - b);
+  const step = +$("#step").value;
+  if (step > 1) {
+    const kept = []; let next = times[0];
+    for (const t of times) if (t >= next) { kept.push(t); next = t + step; }
+    times = kept;
+  }
+  const keys = Object.keys(RX);
+  const series = {};
+  keys.forEach(k => series[k] = times.map(t => samples.get(t)[k] ?? null));
+  series.phase = times.map(t => samples.get(t).phase || "");
+  const pos = times.map(t => samples.get(t)).filter(s => s.lat != null);
+  const home = pos.length ? {
+    lat: pos.reduce((a, s) => a + s.lat, 0) / pos.length,
+    lon: pos.reduce((a, s) => a + s.lon, 0) / pos.length,
+    moving: Math.max(...pos.map(s => s.lat)) - Math.min(...pos.map(s => s.lat)) > 0.005,
+  } : null;
+  applyRun({ label: files[0].webkitRelativePath?.split("/")[0] || files[0].name,
+             path: null, meta: {}, sources: used.map(f => ({ file: f })),
+             times, series, home, step });
+  state.lastFiles = files;
+}
+
+// 走行範囲がちょうど収まるズーム(静止なら市街地スケール)
+function autoZoom(run) {
+  const la = (run.series.lat || []).filter(v => v != null);
+  const lo = (run.series.lon || []).filter(v => v != null);
+  if (la.length < 2) return 12;
+  // 軌跡が地図幅(約600px)に収まる最大ズームを選ぶ
+  const spanLat = Math.max(...la) - Math.min(...la);
+  const spanLon = Math.max(...lo) - Math.min(...lo);
+  const span = Math.max(spanLat * 1.4, spanLon, 0.0015);  // 緯度は縦に効く
+  const z = Math.log2(600 / 256 * 360 / span);
+  return Math.max(3, Math.min(15, Math.floor(z)));
+}
+
+// ---------- browser dialog ----------
+async function browse(path) {
+  const j = await api("/api/browse", { path });
+  $("#pathInput").value = j.path;
+  const list = $("#list"); list.innerHTML = "";
+  if (j.parent) list.appendChild(entry("../ (上へ)", j.parent, true, false));
+  j.entries.forEach(e => list.appendChild(
+    entry((e.dir ? "📁 " : "📄 ") + e.name, e.path, e.dir, e.run)));
+}
+function entry(label, path, isDir, isRun) {
+  const d = document.createElement("div");
+  d.innerHTML = "<span>" + label + "</span>" +
+    (isRun ? '<span class="badge">計測データ</span>' : "");
+  d.onclick = () => { isDir ? browse(path) : (closeDlg(), loadRun(path)); };
+  return d;
+}
+function closeDlg() { $("#browser").close(); }
+$("#pick").onclick = () => {
+  if (SERVER_MODE) { $("#browser").showModal(); browse($("#pathInput").value || "."); }
+  else $("#dirInput").click();   // 単体モードはフォルダ選択ダイアログ
+};
+$("#dirInput").onchange = e => loadFiles([...e.target.files]);
+$("#fileInput").onchange = e => loadFiles([...e.target.files]);
+$("#closeBrowser").onclick = closeDlg;
+$("#goPath").onclick = () => browse($("#pathInput").value);
+$("#useThis").onclick = () => { const p = $("#pathInput").value; closeDlg(); loadRun(p); };
+$("#step").onchange = () => {
+  if (state.run && state.run.path) loadRun(state.run.path);
+  else if (state.lastFiles) loadFiles(state.lastFiles);
+};
+
+// ---------- playback ----------
+$("#play").onclick = () => setPlaying(!state.playing);
+function setPlaying(on) {
+  state.playing = on;
+  $("#play").textContent = on ? "❚❚ 一時停止" : "▶ 再生";
+  clearInterval(state.timer);
+  if (on) state.timer = setInterval(tick, 1000 / Math.min(10, +$("#speed").value));
+}
+$("#speed").onchange = () => { if (state.playing) setPlaying(true); };
+function tick() {
+  if (!state.run) return;
+  const stepFrames = Math.max(1, Math.round(+$("#speed").value /
+    Math.min(10, +$("#speed").value)));
+  state.idx += stepFrames;
+  if (state.idx >= state.run.times.length) { state.idx = 0; }
+  $("#timeline").value = state.idx;
+  render();
+}
+$("#timeline").oninput = e => { state.idx = +e.target.value; render(); };
+
+// ---------- rendering ----------
+function fmtClock(epoch) {
+  const d = new Date(epoch * 1000);
+  const jst = new Date(d.getTime() + 9 * 3600 * 1000);
+  return jst.toISOString().replace("T", " ").slice(0, 19) + " JST";
+}
+function cur(key) {
+  const s = state.run.series[key];
+  return s ? s[state.idx] : null;
+}
+function nearest(key, i) {
+  const s = state.run.series[key]; if (!s) return null;
+  for (let d = 0; d < 60; d++) {
+    if (s[i - d] != null) return s[i - d];
+    if (s[i + d] != null) return s[i + d];
+  }
+  return null;
+}
+
+function render(initial) {
+  if (!state.run) return;
+  const t = state.run.times[state.idx];
+  $("#clock").textContent = fmtClock(t);
+  drawTiles();
+  drawStrip();
+  updateHome();
+  drawSky();
+  drawMap();
+  maybeFetchSats(t);
+  maybeFetchRain(t);
+}
+
+function drawTiles() {
+  const defs = [
+    ["下り", cur("down_mbps"), "Mbps"], ["上り", cur("up_mbps"), "Mbps"],
+    ["RTT", cur("rtt_ms"), "ms"], ["SINR", cur("snr_db"), "dB"],
+    ["速度", cur("speed"), "m/s"],
+  ];
+  $("#tiles").innerHTML = defs.filter(d => d[1] != null).map(d =>
+    `<div class="tile"><div class="k">${d[0]}</div><div class="v">${
+      (+d[1]).toFixed(d[2] === "Mbps" ? 1 : 2)}<span class="u">${d[2]}</span></div></div>`
+  ).join("") || '<span class="muted">この時刻のデータはありません</span>';
+}
+
+function fitCanvas(c, h) {
+  const w = c.clientWidth || 600;
+  if (c.width !== w * devicePixelRatio || c.height !== h * devicePixelRatio) {
+    c.width = w * devicePixelRatio; c.height = h * devicePixelRatio;
+  }
+  const g = c.getContext("2d");
+  g.setTransform(devicePixelRatio, 0, 0, devicePixelRatio, 0, 0);
+  g.clearRect(0, 0, w, h);
+  return [g, w, h];
+}
+const css = v => getComputedStyle(document.body).getPropertyValue(v).trim();
+
+function drawStrip() {
+  const [g, w, h] = fitCanvas($("#strip"), 150);
+  const n = state.run.times.length; if (!n) return;
+  const pad = { l: 40, r: 8, t: 8, b: 16 };
+  const plot = { w: w - pad.l - pad.r, h: h - pad.t - pad.b };
+  const chans = [["down_mbps", "--s1"], ["up_mbps", "--s2"],
+                 ["rtt_ms", "--s3"], ["snr_db", "--s4"]];
+  g.strokeStyle = css("--grid"); g.beginPath();
+  g.moveTo(pad.l, pad.t + plot.h); g.lineTo(w - pad.r, pad.t + plot.h); g.stroke();
+  chans.forEach(([key, col]) => {
+    const s = state.run.series[key]; if (!s || !s.some(v => v != null)) return;
+    const vals = s.filter(v => v != null);
+    const max = Math.max(...vals) || 1;
+    g.strokeStyle = css(col); g.lineWidth = 1.5; g.beginPath();
+    let pen = false;
+    s.forEach((v, i) => {
+      if (v == null) { pen = false; return; }
+      const x = pad.l + plot.w * (i / Math.max(1, n - 1));
+      const y = pad.t + plot.h * (1 - v / max);
+      pen ? g.lineTo(x, y) : g.moveTo(x, y); pen = true;
+    });
+    g.stroke();
+  });
+  const x = pad.l + plot.w * (state.idx / Math.max(1, n - 1));
+  g.strokeStyle = css("--crit"); g.lineWidth = 1.5;
+  g.beginPath(); g.moveTo(x, pad.t); g.lineTo(x, pad.t + plot.h); g.stroke();
+  g.fillStyle = css("--muted"); g.font = "11px system-ui";
+  g.fillText(fmtClock(state.run.times[0]).slice(5, 16), pad.l, h - 4);
+  g.textAlign = "right";
+  g.fillText(fmtClock(state.run.times[n - 1]).slice(5, 16), w - pad.r, h - 4);
+  g.textAlign = "left";
+}
+$("#strip").onclick = e => {
+  if (!state.run) return;
+  const r = e.target.getBoundingClientRect();
+  const frac = (e.clientX - r.left - 40) / (r.width - 48);
+  state.idx = Math.max(0, Math.min(state.run.times.length - 1,
+    Math.round(frac * (state.run.times.length - 1))));
+  $("#timeline").value = state.idx; render();
+};
+
+// ---------- sky view ----------
+function drawSky() {
+  const [g, w, h] = fitCanvas($("#sky"), 440);
+  const cx = w / 2, cy = h / 2, R = Math.min(w, h) / 2 - 24;
+  g.strokeStyle = css("--grid");
+  [0, 30, 60].forEach(el => {
+    g.beginPath(); g.arc(cx, cy, R * (1 - el / 90), 0, 7); g.stroke();
+  });
+  g.fillStyle = css("--muted"); g.font = "11px system-ui"; g.textAlign = "center";
+  [["N", 0], ["E", 90], ["S", 180], ["W", 270]].forEach(([lbl, az]) => {
+    const a = (az - 90) * Math.PI / 180;
+    g.fillText(lbl, cx + (R + 12) * Math.cos(a), cy + (R + 12) * Math.sin(a) + 4);
+  });
+  g.fillText("30°", cx, cy - R * (1 - 30 / 90) - 3);
+
+  const project = (az, el) => {
+    const r = R * (1 - Math.max(0, Math.min(90, el)) / 90);
+    const a = (az - 90) * Math.PI / 180;
+    return [cx + r * Math.cos(a), cy + r * Math.sin(a)];
+  };
+  // 直近の指向履歴(ハンドオーバーで不連続に跳ぶのが見える)
+  const S = state.run.series;
+  ["kymeta", "starlink"].forEach(src => {
+    if (!S[src + "_az"]) return;
+    g.strokeStyle = css("--crit"); g.globalAlpha = .25; g.lineWidth = 1.5;
+    g.beginPath(); let pen = false;
+    for (let i = Math.max(0, state.idx - 60); i <= state.idx; i++) {
+      const a = S[src + "_az"][i], e = S[src + "_el"][i];
+      if (a == null || e == null) { pen = false; continue; }
+      const r = R * (1 - Math.max(0, Math.min(90, e)) / 90);
+      const ang = (a - 90) * Math.PI / 180;
+      const x = cx + r * Math.cos(ang), y = cy + r * Math.sin(ang);
+      pen ? g.lineTo(x, y) : g.moveTo(x, y); pen = true;
+    }
+    g.stroke(); g.globalAlpha = 1;
+  });
+
+  const colors = { starlink: css("--s1"), oneweb: css("--s2") };
+  Object.entries(state.sats).forEach(([group, list]) => {
+    g.fillStyle = colors[group] || css("--s3");
+    (list || []).forEach(s => {
+      const [x, y] = project(s.az, s.el);
+      g.beginPath(); g.arc(x, y, 3.2, 0, 7); g.fill();
+    });
+  });
+  // antenna pointing
+  [["kymeta", "Kymeta"], ["starlink", "Starlink"]].forEach(([src, label]) => {
+    const az = nearest(src + "_az", state.idx), el = nearest(src + "_el", state.idx);
+    if (az == null || el == null) return;
+    // どの衛星を掴んでいそうか: 指向に最も近い1機を線で結ぶ
+    const target = nearestSat(az, el);
+    if (target) {
+      const [tx, ty] = project(target.sat.az, target.sat.el);
+      g.strokeStyle = css("--s3"); g.lineWidth = 2; g.globalAlpha = .9;
+      g.beginPath(); g.arc(tx, ty, 7, 0, 7); g.stroke(); g.globalAlpha = 1;
+      g.fillStyle = css("--s3"); g.textAlign = "left"; g.font = "11px system-ui";
+      g.fillText(`${target.sat.name} (${target.sep.toFixed(1)}°)`, tx + 10, ty - 8);
+    }
+    const [x, y] = project(az, el);
+    g.strokeStyle = css("--crit"); g.lineWidth = 2;
+    g.beginPath(); g.arc(x, y, 9, 0, 7); g.stroke();
+    g.beginPath(); g.moveTo(cx, cy); g.lineTo(x, y);
+    g.setLineDash([4, 4]); g.globalAlpha = .6; g.stroke();
+    g.setLineDash([]); g.globalAlpha = 1;
+    g.fillStyle = css("--crit"); g.textAlign = "left";
+    g.fillText(`${label} ${az.toFixed(0)}°/${el.toFixed(0)}°`, x + 12, y + 4);
+  });
+}
+
+// 角距離が最小の衛星(= 指向先の候補)
+function nearestSat(az, el) {
+  let best = null;
+  const toXYZ = (a, e) => {
+    const ar = a * Math.PI / 180, er = e * Math.PI / 180;
+    return [Math.cos(er) * Math.cos(ar), Math.cos(er) * Math.sin(ar), Math.sin(er)];
+  };
+  const p = toXYZ(az, el);
+  Object.values(state.sats).forEach(list => (list || []).forEach(s => {
+    const q = toXYZ(s.az, s.el);
+    const dot = Math.min(1, Math.max(-1, p[0]*q[0] + p[1]*q[1] + p[2]*q[2]));
+    const sep = Math.acos(dot) * 180 / Math.PI;
+    if (!best || sep < best.sep) best = { sat: s, sep };
+  }));
+  return best && best.sep < 25 ? best : null;
+}
+
+// 単体モード用: CelesTrakからTLEを取得(CORS許可あり)して satellite.js で計算
+const TLE_URL = g =>
+  `https://celestrak.org/NORAD/elements/gp.php?GROUP=${g}&FORMAT=tle`;
+const tleCache = {};
+async function loadTLE(group) {
+  if (tleCache[group]) return tleCache[group];
+  const key = "tle_" + group, stamp = "tle_at_" + group;
+  const cached = localStorage.getItem(key), at = +localStorage.getItem(stamp);
+  let text;
+  if (cached && Date.now() - at < 12 * 3600e3) text = cached;
+  else {
+    text = await (await fetch(TLE_URL(group))).text();
+    try { localStorage.setItem(key, text); localStorage.setItem(stamp, Date.now()); }
+    catch (e) { /* 容量超過は無視(毎回取得になるだけ) */ }
+  }
+  const lines = text.split("\n").map(l => l.trimEnd()).filter(l => l.trim());
+  const recs = [];
+  for (let i = 0; i + 2 < lines.length + 1; i += 3) {
+    const [name, l1, l2] = [lines[i], lines[i + 1], lines[i + 2]];
+    if (!l1 || !l2 || !l1.startsWith("1 ") || !l2.startsWith("2 ")) continue;
+    try { recs.push({ name: name.trim(), rec: satellite.twoline2satrec(l1, l2) }); }
+    catch (e) { /* 壊れた要素は飛ばす */ }
+  }
+  tleCache[group] = recs;
+  return recs;
+}
+function lookAnglesJS(recs, date, lat, lon, minEl) {
+  const gmst = satellite.gstime(date);
+  const obs = {
+    latitude: satellite.degreesToRadians(lat),
+    longitude: satellite.degreesToRadians(lon), height: 0,
+  };
+  const out = [];
+  for (const { name, rec } of recs) {
+    const pv = satellite.propagate(rec, date);
+    if (!pv || !pv.position) continue;
+    const ecf = satellite.eciToEcf(pv.position, gmst);
+    const la = satellite.ecfToLookAngles(obs, ecf);
+    const el = satellite.radiansToDegrees(la.elevation);
+    if (el < minEl) continue;
+    out.push({
+      name,
+      az: (satellite.radiansToDegrees(la.azimuth) + 360) % 360,
+      el, range_km: Math.round(la.rangeSat * 10) / 10,
+    });
+  }
+  out.sort((a, b) => b.el - a.el);
+  return out;
+}
+
+async function maybeFetchSats(t) {
+  const home = activeHome(); if (!home) { $("#satInfo").textContent =
+    "アンテナ位置が未設定のため衛星を表示できません"; return; }
+  const bucket = Math.round(t / 10) * 10;
+  if (state.satAt === bucket) return;
+  state.satAt = bucket;
+  try {
+    if (SERVER_MODE) {
+      const j = await api("/api/sats", {
+        lat: home.lat, lon: home.lon, t: bucket, min_el: $("#minEl").value,
+      });
+      state.sats = j.sats;
+      $("#satInfo").textContent = Object.entries(j.info).map(([g, i]) =>
+        i.error ? `${g}: ${i.error}` :
+          `${g} ${(j.sats[g] || []).length}機(TLE ${i.tle_age_days}日前)`
+      ).join(" / ");
+    } else {
+      const date = new Date(bucket * 1000);
+      const minEl = +$("#minEl").value;
+      const sats = {}, parts = [];
+      for (const g of ["starlink", "oneweb"]) {
+        const recs = await loadTLE(g);
+        sats[g] = lookAnglesJS(recs, date, home.lat, home.lon, minEl);
+        parts.push(`${g} ${sats[g].length}機 / 全${recs.length}`);
+      }
+      state.sats = sats;
+      $("#satInfo").textContent = parts.join(" / ") + "(TLEは最新版)";
+    }
+    drawSky();
+  } catch (e) { $("#satInfo").textContent = "衛星: " + e.message; }
+}
+$("#minEl").onchange = () => { state.satAt = null; render(); };
+
+// ---------- map ----------
+function activeHome() {
+  return state.homeManual || (state.home && { lat: state.home.lat, lon: state.home.lon });
+}
+function updateHome() {
+  const h = activeHome();
+  const live = (cur("lat") != null && cur("lon") != null)
+    ? { lat: cur("lat"), lon: cur("lon") } : null;
+  if (live) state.liveHome = live;
+  $("#posInfo").textContent = h
+    ? `位置: ${(live || h).lat.toFixed(5)}, ${(live || h).lon.toFixed(5)}` +
+      (state.homeManual ? "(手動指定)" :
+        state.home && state.home.moving ? "(移動あり)" : "(データより)")
+    : "アンテナ位置が不明です。「地図上で位置を指定」を押してください";
+}
+function lonToX(lon, z) { return (lon + 180) / 360 * Math.pow(2, z); }
+function latToY(lat, z) {
+  const r = lat * Math.PI / 180;
+  return (1 - Math.log(Math.tan(r) + 1 / Math.cos(r)) / Math.PI) / 2 * Math.pow(2, z);
+}
+function xToLon(x, z) { return x / Math.pow(2, z) * 360 - 180; }
+function yToLat(y, z) {
+  const n = Math.PI - 2 * Math.PI * y / Math.pow(2, z);
+  return 180 / Math.PI * Math.atan(0.5 * (Math.exp(n) - Math.exp(-n)));
+}
+
+function drawMap() {
+  const [g, w, h] = fitCanvas($("#map"), 440);
+  const home = state.liveHome || activeHome();
+  g.fillStyle = css("--page"); g.fillRect(0, 0, w, h);
+  if (!home) {
+    g.fillStyle = css("--muted"); g.textAlign = "center";
+    g.fillText("アンテナ位置が不明です(下のボタンで指定できます)", w / 2, h / 2);
+    return;
+  }
+  const z = state.zoom, TS = 256;
+  const cx = lonToX(home.lon, z) * TS, cy = latToY(home.lat, z) * TS;
+  const x0 = cx - w / 2, y0 = cy - h / 2;
+  for (let tx = Math.floor(x0 / TS); tx <= Math.floor((x0 + w) / TS); tx++) {
+    for (let ty = Math.floor(y0 / TS); ty <= Math.floor((y0 + h) / TS); ty++) {
+      const img = tile(z, tx, ty);
+      if (img && img.complete && img.naturalWidth)
+        g.drawImage(img, tx * TS - x0, ty * TS - y0, TS, TS);
+    }
+  }
+  // rain overlay
+  if (state.rain && state.rain.available) {
+    const { lats, lons, grid, n } = state.rain;
+    const dLat = Math.abs(lats[1] - lats[0]), dLon = Math.abs(lons[1] - lons[0]);
+    for (let i = 0; i < n; i++) for (let j = 0; j < n; j++) {
+      const v = grid[i * n + j]; if (v == null || v < 0.05) continue;
+      const px = lonToX(lons[j] - dLon / 2, z) * TS - x0;
+      const py = latToY(lats[i] + dLat / 2, z) * TS - y0;
+      const pw = (lonToX(lons[j] + dLon / 2, z) * TS - x0) - px;
+      const ph = (latToY(lats[i] - dLat / 2, z) * TS - y0) - py;
+      g.fillStyle = rainColor(v); g.globalAlpha = .55;
+      g.fillRect(px, py, pw, ph); g.globalAlpha = 1;
+    }
+  }
+  // track + marker
+  const S = state.run && state.run.series;
+  if (S && S.lat) {
+    g.strokeStyle = css("--s3"); g.lineWidth = 2; g.beginPath();
+    let pen = false;
+    for (let i = 0; i < S.lat.length; i++) {
+      if (S.lat[i] == null) { pen = false; continue; }
+      const px = lonToX(S.lon[i], z) * TS - x0, py = latToY(S.lat[i], z) * TS - y0;
+      pen ? g.lineTo(px, py) : g.moveTo(px, py); pen = true;
+    }
+    g.stroke();
+  }
+  const mx = lonToX(home.lon, z) * TS - x0, my = latToY(home.lat, z) * TS - y0;
+  g.fillStyle = css("--crit"); g.beginPath(); g.arc(mx, my, 6, 0, 7); g.fill();
+  g.strokeStyle = "#fff"; g.lineWidth = 2; g.stroke();
+  // pointing arrow (azimuth) from the antenna
+  const az = nearest("kymeta_az", state.idx) ?? nearest("starlink_az", state.idx);
+  if (az != null) {
+    const a = (az - 90) * Math.PI / 180, L = 46;
+    g.strokeStyle = css("--crit"); g.lineWidth = 2.5;
+    g.beginPath(); g.moveTo(mx, my);
+    g.lineTo(mx + L * Math.cos(a), my + L * Math.sin(a)); g.stroke();
+  }
+  g.fillStyle = css("--muted"); g.font = "10px system-ui"; g.textAlign = "right";
+  g.fillText("© OpenStreetMap contributors", w - 6, h - 6); g.textAlign = "left";
+}
+const _tiles = {};
+function tile(z, x, y) {
+  const max = Math.pow(2, z);
+  if (y < 0 || y >= max) return null;
+  const key = `${z}/${((x % max) + max) % max}/${y}`;
+  if (!_tiles[key]) {
+    const img = new Image();
+    img.onload = () => drawMap();
+    const tx = ((x % max) + max) % max;
+    img.crossOrigin = "anonymous";
+    img.src = SERVER_MODE
+      ? `/api/tile?z=${z}&x=${tx}&y=${y}`
+      : `https://tile.openstreetmap.org/${z}/${tx}/${y}.png`;
+    _tiles[key] = img;
+  }
+  return _tiles[key];
+}
+function rainColor(v) {
+  if (v >= 30) return "#eb6834";
+  if (v >= 10) return "#184f95";
+  if (v >= 5) return "#2a78d6";
+  if (v >= 1) return "#6da7ec";
+  return "#cde2fb";
+}
+$("#zoomIn").onclick = () => { state.zoom = Math.min(14, state.zoom + 1); drawMap(); };
+$("#zoomOut").onclick = () => { state.zoom = Math.max(3, state.zoom - 1); drawMap(); };
+$("#setPos").onclick = () => {
+  state.pickMode = true;
+  setStatus("地図をクリックしてアンテナ位置を指定してください");
+};
+$("#map").onclick = e => {
+  if (!state.pickMode) return;
+  const c = $("#map"), r = c.getBoundingClientRect();
+  const home = state.liveHome || activeHome() || { lat: 35.68, lon: 139.76 };
+  const z = state.zoom, TS = 256, w = r.width, h = r.height;
+  const x0 = lonToX(home.lon, z) * TS - w / 2, y0 = latToY(home.lat, z) * TS - h / 2;
+  state.homeManual = {
+    lat: yToLat((y0 + (e.clientY - r.top)) / TS, z),
+    lon: xToLon((x0 + (e.clientX - r.left)) / TS, z),
+  };
+  state.pickMode = false; state.satAt = null; state.rainAt = null;
+  setStatus("アンテナ位置を手動設定しました");
+  render();
+};
+
+// ---------- rain ----------
+// 単体モード: Open-Meteo を直接(CORS許可あり)。7x7グリッドを一括取得
+async function rainDirect(lat, lon, epoch) {
+  const N = 7, SPAN = 1.0, half = SPAN / 2;
+  const lonScale = 1 / Math.max(Math.cos(lat * Math.PI / 180), 0.2);
+  const lats = [], lons = [];
+  for (let i = 0; i < N; i++) {
+    const f = -half + SPAN * i / (N - 1);
+    lats.push(+(lat + f).toFixed(4));
+    lons.push(+(lon + f * lonScale).toFixed(4));
+  }
+  const pLat = [], pLon = [];
+  lats.forEach(la => lons.forEach(lo => { pLat.push(la); pLon.push(lo); }));
+  const when = new Date(epoch * 1000);
+  const ageDays = Math.floor((Date.now() - when.getTime()) / 86400e3);
+  const iso = when.toISOString().slice(0, 13) + ":00";
+  const base = ageDays <= 90
+    ? "https://api.open-meteo.com/v1/forecast"
+    : "https://archive-api.open-meteo.com/v1/archive";
+  const q = new URLSearchParams({
+    latitude: pLat.join(","), longitude: pLon.join(","),
+    hourly: "precipitation", timezone: "UTC",
+  });
+  if (ageDays <= 90) {
+    q.set("past_days", String(Math.max(1, Math.min(92, ageDays + 1))));
+    q.set("forecast_days", "1");
+  } else {
+    const day = when.toISOString().slice(0, 10);
+    q.set("start_date", day);
+    q.set("end_date", new Date(when.getTime() + 86400e3).toISOString().slice(0, 10));
+  }
+  let payload = await (await fetch(base + "?" + q)).json();
+  if (!Array.isArray(payload)) payload = [payload];
+  const grid = payload.map(e => {
+    const h = (e.hourly && e.hourly.time) || [];
+    const i = h.indexOf(iso);
+    return i >= 0 ? e.hourly.precipitation[i] : null;
+  });
+  return { lats, lons, grid, n: N, hour_utc: iso, unit: "mm/h",
+           source: ageDays <= 90 ? "Open-Meteo (実況/予報)" : "Open-Meteo (ERA5)",
+           available: grid.some(v => v != null) };
+}
+async function maybeFetchRain(t) {
+  const home = activeHome(); if (!home) return;
+  const bucket = Math.floor(t / 3600) * 3600;
+  if (state.rainAt === bucket) return;
+  state.rainAt = bucket;
+  try {
+    const j = SERVER_MODE
+      ? await api("/api/rain", { lat: home.lat, lon: home.lon, t: bucket })
+      : await rainDirect(home.lat, home.lon, bucket);
+    state.rain = j;
+    $("#rainInfo").textContent = j.available
+      ? `${j.hour_utc}Z の降水 / ${j.source}`
+      : "この時刻の降水データは取得できませんでした";
+    drawMap();
+  } catch (e) { $("#rainInfo").textContent = "降水: " + e.message; }
+}
+
+// ---------- boot ----------
+window.addEventListener("resize", () => { if (state.run) render(); });
+const initial = new URLSearchParams(location.search).get("path");
+if (initial) { $("#pathInput").value = initial; loadRun(initial); }
+else {
+  $("#pathInput").value = "";
+  setStatus(SERVER_MODE
+    ? "「データを選択…」からCSVのフォルダを選んでください"
+    : "「データを選択…」で測定フォルダを選んでください(Pythonなしで動作中)");
+}
+</script>
+</body>
+</html>
