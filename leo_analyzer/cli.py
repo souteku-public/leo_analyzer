@@ -198,6 +198,18 @@ def build_parser():
         "(embedded spectrum data) into a companion .jsonl.gz, then exit",
     )
     p.add_argument(
+        "--viewer",
+        action="store_true",
+        help="launch the data viewer (browser UI: replay any captured CSVs "
+        "over a rain map and a satellite sky view)",
+    )
+    p.add_argument(
+        "--viewer-port",
+        type=int,
+        default=8765,
+        help="port for --viewer (default: 8765)",
+    )
+    p.add_argument(
         "--measure",
         choices=["full", "rtt", "none"],
         default="full",
@@ -387,6 +399,13 @@ async def run(args):
             print(f"    {col}: {size / 1e6:.1f} MB")
         print(f"軽量CSV : {slim}  ({st['slim_bytes'] / 1e6:.1f} MB)")
         print(f"分離データ: {bulk}  ({st['bulk_bytes'] / 1e6:.1f} MB)")
+        return
+
+    if args.viewer:
+        from .viewer.server import serve
+
+        serve(port=args.viewer_port,
+              start_path=args.report or (args.compare[0] if args.compare else None))
         return
 
     if args.compare:
