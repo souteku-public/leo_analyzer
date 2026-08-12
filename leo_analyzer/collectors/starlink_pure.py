@@ -306,16 +306,23 @@ class PureDishClient:
         self._channel.connect()
         self._build_classes()
 
-    def get_status(self):
-        """Return the dish_get_status message (protobuf object)."""
+    def _handle(self, field: str):
         if self._request_cls is None:
             self.connect()
         request = self._request_cls()
-        request.get_status.SetInParent()
+        getattr(request, field).SetInParent()
         reply = self._channel.call(HANDLE_PATH, request.SerializeToString())
         response = self._response_cls()
         response.ParseFromString(reply)
-        return response.dish_get_status
+        return response
+
+    def get_status(self):
+        """Return the dish_get_status message (protobuf object)."""
+        return self._handle("get_status").dish_get_status
+
+    def get_location(self):
+        """Return the get_location message (needs dish location access)."""
+        return self._handle("get_location").get_location
 
     def close(self):
         if self._channel is not None:

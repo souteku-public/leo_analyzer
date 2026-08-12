@@ -131,17 +131,39 @@ dialog::backdrop{background:rgba(0,0,0,.45)}
       <span id="posInfo" class="muted"></span>
       <span style="flex:1"></span>
       <button id="setPos">地図上で位置を指定</button>
+      <button id="posEntry">座標を入力</button>
       <button id="zoomIn">＋</button><button id="zoomOut">−</button>
     </div>
-    <div class="legend">
+    <div class="row" style="margin-top:4px">
+      <label class="muted">雨雲
+        <select id="rainSrc">
+          <option value="auto" selected>自動</option>
+          <option value="jma">気象庁 1km(日本・直近のみ)</option>
+          <option value="om">Open-Meteo 11km(全世界・過去も可)</option>
+          <option value="off">表示しない</option>
+        </select>
+      </label>
+      <span id="rainInfo2" class="muted"></span>
+    </div>
+    <div class="legend" id="legendJma" style="display:none">
+      <span class="muted">降水強度 mm/h(気象庁):</span>
+      <span><span class="sw" style="background:#f2f2ff"></span>1</span>
+      <span><span class="sw" style="background:#a0d2ff"></span>5</span>
+      <span><span class="sw" style="background:#218cff"></span>10</span>
+      <span><span class="sw" style="background:#0041ff"></span>20</span>
+      <span><span class="sw" style="background:#faf500"></span>30</span>
+      <span><span class="sw" style="background:#ff9900"></span>50</span>
+      <span><span class="sw" style="background:#ff2800"></span>80+</span>
+    </div>
+    <div class="legend" id="legendOm">
       <span class="muted">降水量 mm/h:</span>
       <span><span class="sw" style="background:#cde2fb"></span>0.1</span>
       <span><span class="sw" style="background:#6da7ec"></span>1</span>
       <span><span class="sw" style="background:#2a78d6"></span>5</span>
       <span><span class="sw" style="background:#184f95"></span>10</span>
       <span><span class="sw" style="background:#eb6834"></span>30+</span>
-      <span id="rainInfo" class="muted"></span>
     </div>
+    <div class="legend"><span id="rainInfo" class="muted"></span></div>
   </section>
 </main>
 
@@ -214,6 +236,7 @@ function applyRun(run) {
   $("#play").disabled = false;
   state.zoom = autoZoom(run);
   state.sats = {}; state.rain = null; state.satAt = null; state.rainAt = null;
+  state.liveHome = null; state.homeManual = null;   // 前回のデータを持ち越さない
   const src = run.sources.map(s => s.file).join(", ");
   setStatus("読み込み完了: " + src +
     (run.meta && run.meta.tool_version ? " / " + run.meta.tool_version : ""));
@@ -259,7 +282,8 @@ const RX = {
   speed: [/position\.speed$/i],
   kymeta_az: [/look-angle\.azimuth$/i], kymeta_el: [/look-angle\.elevation$/i],
   starlink_az: [/boresight_azimuth_deg$/i], starlink_el: [/boresight_elevation_deg$/i],
-  lat: [/position\.latitude$/i, /\blatitude$/i], lon: [/position\.longitude$/i, /\blongitude$/i],
+  lat: [/position\.latitude$/i, /location\.latitude$/i, /\blatitude$/i],
+  lon: [/position\.longitude$/i, /location\.longitude$/i, /\blongitude$/i],
 };
 const numOf = v => {
   if (v === "" || v == null) return null;
@@ -649,6 +673,7 @@ async function maybeFetchSats(t) {
 $("#minEl").onchange = () => { state.satAt = null; render(); };
 
 // ---------- map ----------
+const DEFAULT_HOME = { lat: 35.681, lon: 139.767 };   // 東京駅(初期表示)
 function activeHome() {
   return state.homeManual || (state.home && { lat: state.home.lat, lon: state.home.lon });
 }
@@ -674,15 +699,17 @@ function yToLat(y, z) {
   return 180 / Math.PI * Math.atan(0.5 * (Math.exp(n) - Math.exp(-n)));
 }
 
+function syncRainLegend() {
+  const jma = !!state.jma;
+  $("#legendJma").style.display = jma ? "" : "none";
+  $("#legendOm").style.display = jma ? "none" : "";
+}
 function drawMap() {
+  syncRainLegend();
   const [g, w, h] = fitCanvas($("#map"), 440);
-  const home = state.liveHome || activeHome();
+  const known = state.liveHome || activeHome();
+  const home = known || DEFAULT_HOME;   // 位置未設定でも地図は出す
   g.fillStyle = css("--page"); g.fillRect(0, 0, w, h);
-  if (!home) {
-    g.fillStyle = css("--muted"); g.textAlign = "center";
-    g.fillText("アンテナ位置が不明です(下のボタンで指定できます)", w / 2, h / 2);
-    return;
-  }
   const z = state.zoom, TS = 256;
   const cx = lonToX(home.lon, z) * TS, cy = latToY(home.lat, z) * TS;
   const x0 = cx - w / 2, y0 = cy - h / 2;
@@ -693,7 +720,21 @@ function drawMap() {
         g.drawImage(img, tx * TS - x0, ty * TS - y0, TS, TS);
     }
   }
-  // rain overlay
+  // rain overlay: 気象庁タイル(高解像度)
+  if (state.jma) {
+    g.globalAlpha = .6;
+    for (let tx = Math.floor(x0 / TS); tx <= Math.floor((x0 + w) / TS); tx++) {
+      for (let ty = Math.floor(y0 / TS); ty <= Math.floor((y0 + h) / TS); ty++) {
+        const max = Math.pow(2, z);
+        if (ty < 0 || ty >= max) continue;
+        const img = jmaTile(state.jma.base, z, ((tx % max) + max) % max, ty);
+        if (img && img.complete && img.naturalWidth)
+          g.drawImage(img, tx * TS - x0, ty * TS - y0, TS, TS);
+      }
+    }
+    g.globalAlpha = 1;
+  }
+  // rain overlay: Open-Meteo グリッド(粗いが全世界・過去も可)
   if (state.rain && state.rain.available) {
     const { lats, lons, grid, n } = state.rain;
     const dLat = Math.abs(lats[1] - lats[0]), dLon = Math.abs(lons[1] - lons[0]);
@@ -720,8 +761,19 @@ function drawMap() {
     g.stroke();
   }
   const mx = lonToX(home.lon, z) * TS - x0, my = latToY(home.lat, z) * TS - y0;
-  g.fillStyle = css("--crit"); g.beginPath(); g.arc(mx, my, 6, 0, 7); g.fill();
-  g.strokeStyle = "#fff"; g.lineWidth = 2; g.stroke();
+  if (known) {
+    g.fillStyle = css("--crit"); g.beginPath(); g.arc(mx, my, 6, 0, 7); g.fill();
+    g.strokeStyle = "#fff"; g.lineWidth = 2; g.stroke();
+  }
+  if (!known || state.pickMode) {
+    g.fillStyle = "rgba(208,59,59,.92)";
+    const msg = state.pickMode ? "クリックしてアンテナ位置を指定"
+                               : "アンテナ位置が未設定です。下のボタンで指定できます";
+    g.font = "bold 13px system-ui"; g.textAlign = "center";
+    const tw = g.measureText(msg).width;
+    g.fillRect(w / 2 - tw / 2 - 10, 8, tw + 20, 26);
+    g.fillStyle = "#fff"; g.fillText(msg, w / 2, 26); g.textAlign = "left";
+  }
   // pointing arrow (azimuth) from the antenna
   const az = nearest("kymeta_az", state.idx) ?? nearest("starlink_az", state.idx);
   if (az != null) {
@@ -731,7 +783,9 @@ function drawMap() {
     g.lineTo(mx + L * Math.cos(a), my + L * Math.sin(a)); g.stroke();
   }
   g.fillStyle = css("--muted"); g.font = "10px system-ui"; g.textAlign = "right";
-  g.fillText("© OpenStreetMap contributors", w - 6, h - 6); g.textAlign = "left";
+  g.fillText("© OpenStreetMap contributors" +
+    (state.jma ? " / 降水: 気象庁" : state.rain ? " / 降水: Open-Meteo" : ""),
+    w - 6, h - 6); g.textAlign = "left";
 }
 const _tiles = {};
 function tile(z, x, y) {
@@ -760,13 +814,29 @@ function rainColor(v) {
 $("#zoomIn").onclick = () => { state.zoom = Math.min(14, state.zoom + 1); drawMap(); };
 $("#zoomOut").onclick = () => { state.zoom = Math.max(3, state.zoom - 1); drawMap(); };
 $("#setPos").onclick = () => {
-  state.pickMode = true;
-  setStatus("地図をクリックしてアンテナ位置を指定してください");
+  state.pickMode = !state.pickMode;
+  $("#setPos").textContent = state.pickMode ? "クリック待ち…(取消)"
+                                            : "地図上で位置を指定";
+  $("#setPos").style.background = state.pickMode ? "var(--crit)" : "";
+  $("#setPos").style.color = state.pickMode ? "#fff" : "";
+  setStatus(state.pickMode ? "地図をクリックしてアンテナ位置を指定してください" : "");
+  drawMap();
+};
+$("#posEntry").onclick = () => {
+  const v = prompt("緯度, 経度 を入力(例: 35.6644, 139.7598)",
+    (activeHome() ? `${activeHome().lat.toFixed(5)}, ${activeHome().lon.toFixed(5)}` : ""));
+  if (!v) return;
+  const m = v.split(/[,\s]+/).map(parseFloat).filter(Number.isFinite);
+  if (m.length < 2) { setStatus("緯度・経度を読み取れませんでした"); return; }
+  state.homeManual = { lat: m[0], lon: m[1] };
+  state.satAt = null; state.rainAt = null;
+  setStatus(`アンテナ位置を設定しました: ${m[0]}, ${m[1]}`);
+  render();
 };
 $("#map").onclick = e => {
   if (!state.pickMode) return;
   const c = $("#map"), r = c.getBoundingClientRect();
-  const home = state.liveHome || activeHome() || { lat: 35.68, lon: 139.76 };
+  const home = state.liveHome || activeHome() || DEFAULT_HOME;
   const z = state.zoom, TS = 256, w = r.width, h = r.height;
   const x0 = lonToX(home.lon, z) * TS - w / 2, y0 = latToY(home.lat, z) * TS - h / 2;
   state.homeManual = {
@@ -774,11 +844,57 @@ $("#map").onclick = e => {
     lon: xToLon((x0 + (e.clientX - r.left)) / TS, z),
   };
   state.pickMode = false; state.satAt = null; state.rainAt = null;
+  $("#setPos").textContent = "地図上で位置を指定";
+  $("#setPos").style.background = ""; $("#setPos").style.color = "";
   setStatus("アンテナ位置を手動設定しました");
   render();
 };
 
 // ---------- rain ----------
+// 気象庁の降水ナウキャスト/解析雨量タイル(1kmメッシュ・5〜10分間隔)。
+// 直近数時間〜約1日しか保持されないため、古い測定では Open-Meteo に戻す。
+const JMA = {
+  nowc: { times: "https://www.jma.go.jp/bosai/jmatile/data/nowc/targetTimes_N1.json",
+          tile: bt => `https://www.jma.go.jp/bosai/jmatile/data/nowc/${bt.basetime}/none/${bt.validtime}/surf/hrpns`,
+          label: "気象庁 高解像度降水ナウキャスト(1km)" },
+  rasrf: { times: "https://www.jma.go.jp/bosai/jmatile/data/rasrf/targetTimes.json",
+           tile: bt => `https://www.jma.go.jp/bosai/jmatile/data/rasrf/${bt.basetime}/none/${bt.validtime}/surf/rasrf`,
+           label: "気象庁 解析雨量(1km)" },
+};
+const jmaTimes = {};
+const jmaUrl = u => SERVER_MODE ? "/api/proxy?url=" + encodeURIComponent(u) : u;
+async function jmaFrame(epoch) {
+  const target = epoch * 1000;
+  let best = null;
+  for (const key of ["nowc", "rasrf"]) {
+    try {
+      if (!jmaTimes[key])
+        jmaTimes[key] = await (await fetch(jmaUrl(JMA[key].times))).json();
+      for (const f of jmaTimes[key]) {
+        const v = f.validtime;
+        const t = Date.UTC(+v.slice(0, 4), +v.slice(4, 6) - 1, +v.slice(6, 8),
+                           +v.slice(8, 10), +v.slice(10, 12));
+        const diff = Math.abs(t - target);
+        if (!best || diff < best.diff) best = { diff, frame: f, key };
+      }
+    } catch (e) { /* この系列は使えない */ }
+  }
+  // 15分以上ずれるならその時刻のデータは無いとみなす
+  return best && best.diff <= 15 * 60e3 ? best : null;
+}
+function jmaTile(base, z, x, y) {
+  const key = `${base}/${z}/${x}/${y}`;
+  if (!_rainTiles[key]) {
+    const img = new Image();
+    img.onload = () => drawMap();
+    img.onerror = () => { img.failed = true; };
+    img.crossOrigin = "anonymous";
+    img.src = jmaUrl(`${base}/${z}/${x}/${y}.png`);
+    _rainTiles[key] = img;
+  }
+  return _rainTiles[key];
+}
+const _rainTiles = {};
 // 単体モード: Open-Meteo を直接(CORS許可あり)。7x7グリッドを一括取得
 async function rainDirect(lat, lon, epoch) {
   const N = 7, SPAN = 1.0, half = SPAN / 2;
@@ -821,14 +937,47 @@ async function rainDirect(lat, lon, epoch) {
            available: grid.some(v => v != null) };
 }
 async function maybeFetchRain(t) {
+  const mode = $("#rainSrc").value;
+  if (mode === "off") { state.rain = null; state.jma = null; drawMap(); return; }
   const home = activeHome(); if (!home) return;
-  const bucket = Math.floor(t / 3600) * 3600;
-  if (state.rainAt === bucket) return;
-  state.rainAt = bucket;
+  // 気象庁タイルは5分刻み、Open-Meteoは1時間刻み
+  const bucket = mode === "om" ? Math.floor(t / 3600) * 3600
+                               : Math.round(t / 300) * 300;
+  if (state.rainAt === bucket + mode) return;
+  state.rainAt = bucket + mode;
+
+  if (mode !== "om") {
+    try {
+      const hit = await jmaFrame(bucket);
+      if (hit) {
+        state.jma = { base: JMA[hit.key].tile(hit.frame), label: JMA[hit.key].label,
+                      validtime: hit.frame.validtime };
+        state.rain = null;
+        const v = hit.frame.validtime;
+        $("#rainInfo").textContent =
+          `${v.slice(4,6)}/${v.slice(6,8)} ${v.slice(8,10)}:${v.slice(10,12)}Z の`
+          + ` ${JMA[hit.key].label}`;
+        $("#rainInfo2").textContent = "";
+        drawMap();
+        return;
+      }
+      if (mode === "jma") {
+        state.jma = null; state.rain = null;
+        $("#rainInfo").textContent =
+          "この時刻の気象庁データはありません(保持期間外/日本国外)";
+        drawMap();
+        return;
+      }
+      $("#rainInfo2").textContent =
+        "気象庁データは保持期間外のため Open-Meteo を使用";
+    } catch (e) { /* 自動モードなら次へフォールバック */ }
+  }
+  state.jma = null;
+  const hour = Math.floor(t / 3600) * 3600;
   try {
     const j = SERVER_MODE
-      ? await api("/api/rain", { lat: home.lat, lon: home.lon, t: bucket })
-      : await rainDirect(home.lat, home.lon, bucket);
+      ? await api("/api/rain", { lat: home.lat, lon: home.lon, t: hour })
+      : await rainDirect(home.lat, home.lon, hour);
     state.rain = j;
     $("#rainInfo").textContent = j.available
       ? `${j.hour_utc}Z の降水 / ${j.source}`
@@ -836,6 +985,7 @@ async function maybeFetchRain(t) {
     drawMap();
   } catch (e) { $("#rainInfo").textContent = "降水: " + e.message; }
 }
+$("#rainSrc").onchange = () => { state.rainAt = null; render(); };
 
 // ---------- boot ----------
 window.addEventListener("resize", () => { if (state.run) render(); });

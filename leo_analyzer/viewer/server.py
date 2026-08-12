@@ -80,6 +80,9 @@ class Handler(BaseHTTPRequestHandler):
                 self._send(b"", "image/x-icon", 200)
             elif route == "/api/tile":
                 self._tile(int(arg("z")), int(arg("x")), int(arg("y")))
+            elif route == "/api/proxy":
+                # JMA rain tiles / target-time indexes, same-origin for the page
+                self._proxy(arg("url", ""))
             else:
                 self._json({"error": "not found"}, 404)
         except FileNotFoundError as e:
@@ -136,6 +139,28 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("Cache-Control", "max-age=86400")
         self.end_headers()
         self.wfile.write(hit)
+
+
+    def _proxy(self, url: str):
+        if not url.startswith("https://www.jma.go.jp/bosai/jmatile/"):
+            self._json({"error": "proxy target not allowed"}, 403)
+            return
+        try:
+            request = urllib.request.Request(
+                url, headers={"User-Agent": "leo_analyzer-viewer/1.0"}
+            )
+            with urllib.request.urlopen(request, timeout=20) as response:
+                body = response.read()
+                ctype = response.headers.get("Content-Type", "application/octet-stream")
+        except Exception as e:
+            self._json({"error": f"{type(e).__name__}: {e}"}, 502)
+            return
+        self.send_response(200)
+        self.send_header("Content-Type", ctype)
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Cache-Control", "max-age=3600")
+        self.end_headers()
+        self.wfile.write(body)
 
 
 def serve(port: int = 8765, open_browser: bool = True, start_path: str = None):

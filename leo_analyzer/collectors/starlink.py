@@ -18,6 +18,7 @@ os.environ.setdefault("PROTOCOL_BUFFERS_PYTHON_IMPLEMENTATION", "python")
 from google.protobuf.json_format import MessageToDict  # noqa: E402
 
 from ..util import flatten  # noqa: E402
+from .base import compact_error as compact  # noqa: E402
 from .base import Collector  # noqa: E402
 
 DEFAULT_ADDR = "192.168.100.1:9200"
@@ -53,6 +54,10 @@ class StarlinkCollector(Collector):
         self._stub = None
         self._request_class = None
         self._pure = None
+        # get_status carries no position; get_location does, but only when
+        # the dish has local location access enabled in the Starlink app
+        self.want_location = True
+        self._location_denied = None
 
     def _connect(self):
         """Open a channel, falling back to the pure-Python transport.
@@ -107,7 +112,38 @@ class StarlinkCollector(Collector):
                 "dish_get_status が空です(ディッシュが応答しましたが"
                 "ステータスを返していません)"
             )
-        return flatten(status)
+        row = flatten(status)
+        row.update(self._location_blocking())
+        return row
+
+    def _location_blocking(self) -> dict:
+        """Latitude/longitude from get_location, when the dish allows it."""
+        if not self.want_location or self._location_denied:
+            return {}
+        try:
+            if self._pure is not None:
+                message = self._pure.get_location()
+            else:
+                request = self._request_class(get_location={})
+                message = self._stub.Handle(request, timeout=5).get_location
+            data = MessageToDict(message, preserving_proto_field_name=True)
+        except Exception as e:
+            self._location_denied = str(e)
+            print(
+                "[starlink] 位置情報(get_location)を取得できません: "
+                f"{compact(e)}\n"
+                "  Starlinkアプリの 設定 → 詳細設定 で「ローカルネットワーク"
+                "からのアクセス」と位置情報の共有を有効にすると記録できます"
+            )
+            return {}
+        lla = data.get("lla") or {}
+        out = {}
+        if lla.get("lat") is not None and lla.get("lon") is not None:
+            out["location.latitude"] = lla["lat"]
+            out["location.longitude"] = lla["lon"]
+            if lla.get("alt") is not None:
+                out["location.altitude"] = lla["alt"]
+        return out
 
     async def sample(self) -> dict:
         loop = asyncio.get_running_loop()
