@@ -132,8 +132,14 @@ class StarlinkCollector(Collector):
             print(
                 "[starlink] 位置情報(get_location)を取得できません: "
                 f"{compact(e)}\n"
-                "  Starlinkアプリの 設定 → 詳細設定 で「ローカルネットワーク"
-                "からのアクセス」と位置情報の共有を有効にすると記録できます"
+                "  Starlinkアプリで [ログイン] → 設定(SETTINGS) → 詳細設定"
+                "(ADVANCED) → デバッグデータ(DEBUG DATA) の\n"
+                "  「STARLINK LOCATION」にある「ローカルネットワークからの"
+                "アクセスを許可」を有効にしてください(既定は無効)。\n"
+                "  2026年5月以降、標準(Residential)プランではこの機能自体が"
+                "制限されているとの報告があります。\n"
+                "  取得できない場合でも、ビューアの「座標を入力」で位置を"
+                "指定すれば衛星・雨雲の表示は可能です"
             )
             return {}
         lla = data.get("lla") or {}
