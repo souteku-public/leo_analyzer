@@ -19,7 +19,11 @@ CHANNELS = [
     ("snr_db", [r"sinr[_ ]?db$", r"\bsinr$", r"snr_db$"], 1.0),
     ("speed", [r"position\.speed$"], 1.0),
 ]
-# antenna pointing: (source, azimuth patterns, elevation patterns)
+# antenna pointing: (source, azimuth patterns, elevation patterns).
+# Kymeta's look-angle is the direction of the satellite being tracked and
+# jumps at every handover; Starlink only publishes the dish's mounted
+# attitude (boresight) — the phased array's beam vector is not exposed —
+# so the viewer draws the two differently.
 POINTING = [
     ("kymeta", [r"look-angle\.azimuth$"], [r"look-angle\.elevation$"]),
     ("starlink", [r"boresight_azimuth_deg$"], [r"boresight_elevation_deg$"]),
@@ -189,13 +193,18 @@ def load_run(target: str, step: int = 1):
     ]
     home = None
     if positions:
+        mid_lat = sum(p[0] for p in positions) / len(positions)
+        # in metres, so that a test course a few hundred metres across still
+        # counts as a drive (a degree threshold makes that look stationary)
+        span_ns = (max(p[0] for p in positions) - min(p[0] for p in positions)) * 111320
+        span_ew = (max(p[1] for p in positions) - min(p[1] for p in positions)) * (
+            111320 * math.cos(math.radians(mid_lat))
+        )
         home = {
-            "lat": sum(p[0] for p in positions) / len(positions),
+            "lat": mid_lat,
             "lon": sum(p[1] for p in positions) / len(positions),
             "from_data": True,
-            "moving": max(p[0] for p in positions) - min(p[0] for p in positions)
-            > 0.005
-            or max(p[1] for p in positions) - min(p[1] for p in positions) > 0.005,
+            "moving": math.hypot(span_ns, span_ew) > 50,
         }
 
     return {

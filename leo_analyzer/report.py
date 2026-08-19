@@ -490,10 +490,12 @@ COMMON_METRICS = [
      [r"pop_ping_drop_rate$", r"drop_rate$", r"loss"]),
     ("snr_db", "信号品質 (SNR / SINR / CNR)", "dB",
      [r"sinr[_ ]?db$", r"\bsinr$", r"snr_db$", r"cnr[_ ]?db$", r"\bcnr$"]),
-    ("elevation", "仰角", "°",
+    # 同じ「角度」でも Kymeta は追尾中の衛星方向、Starlink は筐体の設置姿勢
+    # (ビーム方向は非公開)。重ねて描くので、その違いを表題に出しておく
+    ("elevation", "仰角 (Kymeta=追尾方向 / Starlink=設置姿勢)", "°",
      [r"look[-_ ]?angle\.elevation$", r"\belevation$",
       r"boresight_elevation_deg$"]),
-    ("azimuth", "方位角", "°",
+    ("azimuth", "方位角 (Kymeta=追尾方向 / Starlink=設置姿勢)", "°",
      [r"look[-_ ]?angle\.azimuth$", r"\bazimuth$", r"boresight_azimuth_deg$"]),
     ("obstruction", "遮蔽 / 障害",  "",
      [r"fraction_obstructed$", r"time_obstructed$", r"currently_obstructed$"]),

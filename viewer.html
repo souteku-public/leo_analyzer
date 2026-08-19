@@ -110,8 +110,10 @@ dialog::backdrop{background:rgba(0,0,0,.45)}
     <div class="legend">
       <span><span class="sw" style="background:var(--s1)"></span>Starlink</span>
       <span><span class="sw" style="background:var(--s2)"></span>OneWeb</span>
-      <span><span class="sw" style="background:var(--crit)"></span>アンテナ指向</span>
-      <span class="muted">中心=天頂 / 外周=地平線</span>
+      <span><span class="sw" style="background:var(--crit)"></span>追尾方向(Look Angle)</span>
+      <span><span class="sw" style="background:var(--muted)"></span>設置姿勢(Boresight)</span>
+      <span class="muted">中心=天頂 / 外周=地平線。
+        Starlinkはビーム方向を公開しないため設置姿勢のみ(固定)</span>
     </div>
     <div class="row" style="margin-top:6px">
       <label class="muted">最低仰角
@@ -285,6 +287,15 @@ const RX = {
   lat: [/position\.latitude$/i, /location\.latitude$/i, /\blatitude$/i],
   lon: [/position\.longitude$/i, /location\.longitude$/i, /\blongitude$/i],
 };
+// 指向データの性質。同じ「方位/仰角」でも意味がまったく違うので区別して描く。
+//   look  … 追尾中の衛星の方向(Look Angle)。ハンドオーバーで跳ぶ
+//   mount … 筐体の設置姿勢(Boresight)。据付後は動かない。Starlinkは
+//           フェーズドアレイのビーム方向をローカルAPIに出していないため、
+//           取得できるのはこちらだけ
+const POINTING = [
+  { src: "kymeta", label: "Kymeta 指向(Look Angle)", kind: "look" },
+  { src: "starlink", label: "Starlink 設置姿勢(Boresight)", kind: "mount" },
+];
 const numOf = v => {
   if (v === "" || v == null) return null;
   if (v === "True" || v === "true") return 1; if (v === "False" || v === "false") return 0;
@@ -331,11 +342,17 @@ async function loadFiles(files) {
   keys.forEach(k => series[k] = times.map(t => samples.get(t)[k] ?? null));
   series.phase = times.map(t => samples.get(t).phase || "");
   const pos = times.map(t => samples.get(t)).filter(s => s.lat != null);
-  const home = pos.length ? {
-    lat: pos.reduce((a, s) => a + s.lat, 0) / pos.length,
-    lon: pos.reduce((a, s) => a + s.lon, 0) / pos.length,
-    moving: Math.max(...pos.map(s => s.lat)) - Math.min(...pos.map(s => s.lat)) > 0.005,
-  } : null;
+  let home = null;
+  if (pos.length) {
+    const mid = pos.reduce((a, s) => a + s.lat, 0) / pos.length;
+    // 度ではなくメートルで判定する。数百mのテストコースを走っても
+    // 度しきい値だと「静止」に見えてしまう
+    const ns = (Math.max(...pos.map(s => s.lat)) - Math.min(...pos.map(s => s.lat))) * 111320;
+    const ew = (Math.max(...pos.map(s => s.lon)) - Math.min(...pos.map(s => s.lon)))
+             * 111320 * Math.cos(mid * Math.PI / 180);
+    home = { lat: mid, lon: pos.reduce((a, s) => a + s.lon, 0) / pos.length,
+             moving: Math.hypot(ns, ew) > 50 };
+  }
   applyRun({ label: files[0].webkitRelativePath?.split("/")[0] || files[0].name,
              path: null, meta: {}, sources: used.map(f => ({ file: f })),
              times, series, home, step });
@@ -523,9 +540,10 @@ function drawSky() {
     const a = (az - 90) * Math.PI / 180;
     return [cx + r * Math.cos(a), cy + r * Math.sin(a)];
   };
-  // 直近の指向履歴(ハンドオーバーで不連続に跳ぶのが見える)
+  // 直近の指向履歴(ハンドオーバーで不連続に跳ぶのが見える)。
+  // 追尾方向(Look Angle)のみ。設置姿勢は動かないので軌跡を描いても意味がない
   const S = state.run.series;
-  ["kymeta", "starlink"].forEach(src => {
+  POINTING.filter(p => p.kind === "look").forEach(({ src }) => {
     if (!S[src + "_az"]) return;
     g.strokeStyle = css("--crit"); g.globalAlpha = .25; g.lineWidth = 1.5;
     g.beginPath(); let pen = false;
@@ -549,26 +567,36 @@ function drawSky() {
     });
   });
   // antenna pointing
-  [["kymeta", "Kymeta"], ["starlink", "Starlink"]].forEach(([src, label]) => {
+  POINTING.forEach(({ src, label, kind }) => {
     const az = nearest(src + "_az", state.idx), el = nearest(src + "_el", state.idx);
     if (az == null || el == null) return;
-    // どの衛星を掴んでいそうか: 指向に最も近い1機を線で結ぶ
-    const target = nearestSat(az, el);
-    if (target) {
-      const [tx, ty] = project(target.sat.az, target.sat.el);
-      g.strokeStyle = css("--s3"); g.lineWidth = 2; g.globalAlpha = .9;
-      g.beginPath(); g.arc(tx, ty, 7, 0, 7); g.stroke(); g.globalAlpha = 1;
-      g.fillStyle = css("--s3"); g.textAlign = "left"; g.font = "11px system-ui";
-      g.fillText(`${target.sat.name} (${target.sep.toFixed(1)}°)`, tx + 10, ty - 8);
+    const look = kind === "look";
+    // 追尾方向のときだけ「どの衛星を掴んでいそうか」を線で結ぶ。
+    // 設置姿勢に最も近い衛星を出すと、掴んでいる衛星と誤読される
+    if (look) {
+      const target = nearestSat(az, el);
+      if (target) {
+        const [tx, ty] = project(target.sat.az, target.sat.el);
+        g.strokeStyle = css("--s3"); g.lineWidth = 2; g.globalAlpha = .9;
+        g.beginPath(); g.arc(tx, ty, 7, 0, 7); g.stroke(); g.globalAlpha = 1;
+        g.fillStyle = css("--s3"); g.textAlign = "left"; g.font = "11px system-ui";
+        g.fillText(`${target.sat.name} (${target.sep.toFixed(1)}°)`, tx + 10, ty - 8);
+      }
     }
     const [x, y] = project(az, el);
-    g.strokeStyle = css("--crit"); g.lineWidth = 2;
-    g.beginPath(); g.arc(x, y, 9, 0, 7); g.stroke();
+    const color = look ? css("--crit") : css("--muted");
+    g.strokeStyle = color; g.lineWidth = look ? 2 : 1.5;
+    g.beginPath();
+    if (look) g.arc(x, y, 9, 0, 7);
+    else g.rect(x - 7, y - 7, 14, 14);  // 追尾方向と取り違えないよう別形状
+    g.stroke();
     g.beginPath(); g.moveTo(cx, cy); g.lineTo(x, y);
-    g.setLineDash([4, 4]); g.globalAlpha = .6; g.stroke();
+    g.setLineDash([4, 4]); g.globalAlpha = look ? .6 : .35; g.stroke();
     g.setLineDash([]); g.globalAlpha = 1;
-    g.fillStyle = css("--crit"); g.textAlign = "left";
-    g.fillText(`${label} ${az.toFixed(0)}°/${el.toFixed(0)}°`, x + 12, y + 4);
+    g.fillStyle = color; g.textAlign = "left"; g.font = "11px system-ui";
+    // Starlinkは方位を負値でも返すので0-360に直して表示する
+    const azDeg = ((az % 360) + 360) % 360;
+    g.fillText(`${label} ${azDeg.toFixed(0)}°/${el.toFixed(0)}°`, x + 12, y + 4);
   });
 }
 
@@ -774,13 +802,21 @@ function drawMap() {
     g.fillRect(w / 2 - tw / 2 - 10, 8, tw + 20, 26);
     g.fillStyle = "#fff"; g.fillText(msg, w / 2, 26); g.textAlign = "left";
   }
-  // pointing arrow (azimuth) from the antenna
-  const az = nearest("kymeta_az", state.idx) ?? nearest("starlink_az", state.idx);
-  if (az != null) {
-    const a = (az - 90) * Math.PI / 180, L = 46;
-    g.strokeStyle = css("--crit"); g.lineWidth = 2.5;
+  // pointing arrow (azimuth) from the antenna: 追尾方向を優先し、
+  // 設置姿勢しか無いときは動かない向きだと分かるよう破線・淡色で描く
+  const arrow = POINTING
+    .map(p => ({ ...p, az: nearest(p.src + "_az", state.idx) }))
+    .filter(p => p.az != null)
+    .sort((a, b) => (a.kind === "look" ? -1 : 1) - (b.kind === "look" ? -1 : 1))[0];
+  if (arrow) {
+    const a = (arrow.az - 90) * Math.PI / 180, L = 46;
+    const look = arrow.kind === "look";
+    g.strokeStyle = look ? css("--crit") : css("--muted");
+    g.lineWidth = 2.5;
+    if (!look) g.setLineDash([5, 4]);
     g.beginPath(); g.moveTo(mx, my);
     g.lineTo(mx + L * Math.cos(a), my + L * Math.sin(a)); g.stroke();
+    g.setLineDash([]);
   }
   g.fillStyle = css("--muted"); g.font = "10px system-ui"; g.textAlign = "right";
   g.fillText("© OpenStreetMap contributors" +
