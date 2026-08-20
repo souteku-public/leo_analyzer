@@ -130,6 +130,15 @@ def build_parser():
         help="Starlink dish gRPC address (default: 192.168.100.1:9200)",
     )
     p.add_argument(
+        "--starlink-obstruction-interval",
+        type=float,
+        default=60.0,
+        metavar="SEC",
+        help="seconds between Starlink obstruction-map fetches; the grid "
+        "goes to starlink_obstruction_map.jsonl.gz and the CSV keeps a "
+        "summary (default: 60, 0 disables)",
+    )
+    p.add_argument(
         "--kymeta-config",
         help="YAML config for the Kymeta collector "
         "(optional; defaults to https://192.168.44.2 with the factory admin "
@@ -238,7 +247,9 @@ def make_collectors(args):
                     f"(python -m pip install -r requirements.txt): {e}"
                 )
             c = StarlinkCollector(
-                addr=args.starlink_addr, transport=args.starlink_transport
+                addr=args.starlink_addr,
+                transport=args.starlink_transport,
+                obstruction_interval=args.starlink_obstruction_interval,
             )
             c.compact = not args.keep_all_columns
             collectors.append(c)

@@ -324,6 +324,10 @@ class PureDishClient:
         """Return the get_location message (needs dish location access)."""
         return self._handle("get_location").get_location
 
+    def get_obstruction_map(self):
+        """Return the dish_get_obstruction_map message (per-direction grid)."""
+        return self._handle("dish_get_obstruction_map").dish_get_obstruction_map
+
     def close(self):
         if self._channel is not None:
             self._channel.close()

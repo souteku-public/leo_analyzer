@@ -30,6 +30,15 @@ POINTING = [
 ]
 LAT_PATTERNS = [r"position\.latitude$", r"\blatitude$", r"\blat$"]
 LON_PATTERNS = [r"position\.longitude$", r"\blongitude$", r"\blon$"]
+OBSTRUCTION_NAMES = (
+    "starlink_obstruction_map.jsonl.gz",
+    "starlink_obstruction_map.jsonl",
+)
+# one grid is ~15k floats, so the index is served on load and each grid is
+# fetched on demand; only the last few are held in memory
+_obs_index_cache = {}
+_obs_grid_cache = {}
+_OBS_GRID_CACHE_MAX = 8
 
 
 def _open_text(path: Path):
@@ -98,6 +107,98 @@ def _csv_files(target: Path):
     for pattern in ("*.csv", "*.csv.gz"):
         files.extend(sorted(target.glob(pattern)))
     return [f for f in files if not f.name.endswith("_slim.csv") or len(files) == 1]
+
+
+# Starlink reconfigures on UTC 15-second boundaries, so packet loss caused
+# by a handover lands in the first seconds of each cycle.
+HANDOVER_PERIOD_S = 15
+HANDOVER_WINDOW_S = 2
+
+
+def _handover_stats(samples: dict):
+    """How much of the packet loss sits in the 15-second handover window.
+
+    Computed on every sample, before the display granularity thins the
+    series — sampling every 10th second would alias against the 15-second
+    period and invent a concentration that is not there.
+    """
+    seconds = [t for t, row in samples.items() if (row.get("loss") or 0) > 0]
+    if not seconds:
+        return None
+    hit = sum(1 for t in seconds if t % HANDOVER_PERIOD_S < HANDOVER_WINDOW_S)
+    expected = HANDOVER_WINDOW_S / HANDOVER_PERIOD_S
+    share = hit / len(seconds)
+    return {
+        "total": len(seconds),
+        "hit": hit,
+        "share": round(share, 4),
+        "expected": round(expected, 4),
+        "ratio": round(share / expected, 2),
+    }
+
+
+def _obstruction_file(target: str):
+    path = Path(target).expanduser()
+    base = path if path.is_dir() else path.parent
+    for name in OBSTRUCTION_NAMES:
+        candidate = base / name
+        if candidate.exists():
+            return candidate
+    return None
+
+
+def obstruction_index(target: str):
+    """Timestamps and shape of every stored obstruction map, no grids."""
+    file = _obstruction_file(target)
+    if file is None:
+        return {"file": None, "maps": []}
+    stamp = (str(file), file.stat().st_mtime, file.stat().st_size)
+    hit = _obs_index_cache.get(str(file))
+    if hit and hit[0] == stamp:
+        return hit[1]
+
+    maps = []
+    with _open_text(file) as f:
+        for i, line in enumerate(f):
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                record = json.loads(line)
+            except ValueError:
+                continue
+            maps.append(
+                {
+                    "i": i,
+                    "epoch": record.get("epoch"),
+                    "rows": record.get("rows"),
+                    "cols": record.get("cols"),
+                    "meta": record.get("meta") or {},
+                }
+            )
+    out = {"file": file.name, "maps": maps}
+    _obs_index_cache[str(file)] = (stamp, out)
+    return out
+
+
+def obstruction_map(target: str, index: int):
+    """One grid, read back from the file by line number."""
+    file = _obstruction_file(target)
+    if file is None:
+        raise FileNotFoundError("障害物マップのファイルがありません")
+    key = (str(file), index)
+    if key in _obs_grid_cache:
+        return _obs_grid_cache[key]
+    with _open_text(file) as f:
+        for i, line in enumerate(f):
+            if i != index:
+                continue
+            record = json.loads(line)
+            if len(_obs_grid_cache) >= _OBS_GRID_CACHE_MAX:
+                _obs_grid_cache.clear()
+            _obs_grid_cache[key] = record
+            return record
+    raise FileNotFoundError(f"障害物マップ #{index} が見つかりません")
 
 
 def load_run(target: str, step: int = 1):
@@ -172,6 +273,8 @@ def load_run(target: str, step: int = 1):
     if not samples:
         raise ValueError("epoch 列を持つCSVが見つかりませんでした")
 
+    handover = _handover_stats(samples)
+
     times = sorted(samples)
     if step > 1:  # thin to the requested granularity
         kept, next_t = [], times[0]
@@ -217,4 +320,5 @@ def load_run(target: str, step: int = 1):
         "series": series,
         "home": home,
         "step": step,
+        "handover": handover,
     }

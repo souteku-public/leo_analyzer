@@ -8,8 +8,10 @@ built-in router default).
 """
 
 import asyncio
+import json
 import os
 import socket
+import time
 
 # Prefer protobuf's pure-Python implementation: on locked-down Windows
 # machines the native accelerator can be blocked by application control.
@@ -22,6 +24,13 @@ from .base import compact_error as compact  # noqa: E402
 from .base import Collector  # noqa: E402
 
 DEFAULT_ADDR = "192.168.100.1:9200"
+
+# The obstruction map is the only per-direction measurement the dish
+# publishes: a square grid of the field of view, one value per direction.
+# It is ~15k floats, far too much for a 1 Hz CSV, so the grid goes to its
+# own jsonl.gz on a slower cadence and the CSV keeps a summary.
+OBSTRUCTION_INTERVAL_S = 60.0
+OBSTRUCTION_FILE = "starlink_obstruction_map.jsonl.gz"
 
 # A proxy configured for internet access (corporate PCs, HTTPS_PROXY in the
 # environment) makes gRPC tunnel even LAN addresses through it, which the
@@ -47,7 +56,12 @@ def check_tcp(addr: str, timeout: float = 3.0):
 class StarlinkCollector(Collector):
     name = "starlink"
 
-    def __init__(self, addr: str = DEFAULT_ADDR, transport: str = "auto"):
+    def __init__(
+        self,
+        addr: str = DEFAULT_ADDR,
+        transport: str = "auto",
+        obstruction_interval: float = OBSTRUCTION_INTERVAL_S,
+    ):
         self.addr = addr
         self.transport = transport  # auto | grpc | pure
         self._channel = None
@@ -58,6 +72,11 @@ class StarlinkCollector(Collector):
         # the dish has local location access enabled in the Starlink app
         self.want_location = True
         self._location_denied = None
+        # obstruction map: 0 disables it entirely
+        self.obstruction_interval = obstruction_interval
+        self._obstruction_denied = None
+        self._obstruction_next = 0.0
+        self._obstruction_file = None
 
     def _connect(self):
         """Open a channel, falling back to the pure-Python transport.
@@ -114,6 +133,7 @@ class StarlinkCollector(Collector):
             )
         row = flatten(status)
         row.update(self._location_blocking())
+        row.update(self._obstruction_blocking())
         return row
 
     def _location_blocking(self) -> dict:
@@ -151,6 +171,123 @@ class StarlinkCollector(Collector):
                 out["location.altitude"] = lla["alt"]
         return out
 
+    # --- obstruction map --------------------------------------------------
+
+    def fetch_obstruction_map(self) -> dict:
+        """One dish_get_obstruction_map reply, grid included."""
+        if self._stub is None and self._pure is None:
+            self._connect()
+        if self._pure is not None:
+            message = self._pure.get_obstruction_map()
+        else:
+            request = self._request_class(dish_get_obstruction_map={})
+            message = self._stub.Handle(
+                request, timeout=10
+            ).dish_get_obstruction_map
+        return MessageToDict(message, preserving_proto_field_name=True)
+
+    @staticmethod
+    def split_obstruction_map(data: dict):
+        """Separate the grid from its metadata.
+
+        The field carrying the grid has been renamed across firmware
+        versions (it is still called 'snr' on many builds even though it
+        holds obstruction fractions), so the longest numeric list wins
+        rather than a hard-coded name.
+        """
+        grid, grid_key, meta = [], None, {}
+        for key, value in data.items():
+            if (
+                isinstance(value, list)
+                and len(value) > len(grid)
+                and all(isinstance(v, (int, float)) for v in value)
+            ):
+                grid, grid_key = value, key
+        for key, value in data.items():
+            if key != grid_key and not isinstance(value, (list, dict)):
+                meta[key] = value
+        return grid, grid_key, meta
+
+    def _obstruction_blocking(self) -> dict:
+        """Fetch the map when due; grid to jsonl.gz, summary to the CSV."""
+        if self.obstruction_interval <= 0 or self._obstruction_denied:
+            return {}
+        now = time.time()
+        if now < self._obstruction_next:
+            return {}
+        self._obstruction_next = now + self.obstruction_interval
+        try:
+            data = self.fetch_obstruction_map()
+        except Exception as e:
+            self._obstruction_denied = compact(e)
+            print(
+                "[starlink] 障害物マップ(dish_get_obstruction_map)を取得"
+                f"できません: {self._obstruction_denied}\n"
+                "  以降は取得を試みません。ステータスの記録は継続します"
+            )
+            return {}
+
+        grid, grid_key, meta = self.split_obstruction_map(data)
+        if not grid:
+            self._obstruction_denied = "grid empty"
+            print(
+                "[starlink] 障害物マップにグリッドが含まれていませんでした"
+                "(ファームウェアが非対応の可能性があります)"
+            )
+            return {}
+
+        rows = int(meta.get("num_rows") or 0)
+        cols = int(meta.get("num_cols") or 0)
+        if not (rows and cols):
+            side = int(round(len(grid) ** 0.5))
+            rows = cols = side if side * side == len(grid) else 0
+        # -1 marks a direction the dish has not observed yet
+        valid = [v for v in grid if v >= 0]
+        blocked = [v for v in valid if v > 0]
+        summary = {
+            "obstruction_map.rows": rows,
+            "obstruction_map.cols": cols,
+            "obstruction_map.valid_cells": len(valid),
+            "obstruction_map.obstructed_cells": len(blocked),
+            "obstruction_map.obstructed_frac": (
+                round(len(blocked) / len(valid), 6) if valid else ""
+            ),
+        }
+        for key in ("min_elevation_deg", "map_reference_frame"):
+            if key in meta:
+                summary[f"obstruction_map.{key}"] = meta[key]
+
+        self._write_obstruction(grid, grid_key, meta, rows, cols)
+        return summary
+
+    def _write_obstruction(self, grid, grid_key, meta, rows, cols):
+        from ..util import epoch_now, utc_now_iso
+
+        if self._obstruction_file is None:
+            import gzip
+
+            self._obstruction_file = gzip.open(
+                self.outdir / OBSTRUCTION_FILE, "at", encoding="utf-8"
+            )
+        self._obstruction_file.write(
+            json.dumps(
+                {
+                    "timestamp_utc": utc_now_iso(),
+                    "epoch": round(epoch_now(), 3),
+                    "rows": rows,
+                    "cols": cols,
+                    "grid_field": grid_key,
+                    "meta": meta,
+                    # rounded: the dish reports fractions, 3 digits is
+                    # plenty and keeps the file about half the size
+                    "grid": [round(v, 3) for v in grid],
+                },
+                ensure_ascii=False,
+            )
+            + "\n"
+        )
+        self._obstruction_file.flush()
+
     async def sample(self) -> dict:
         loop = asyncio.get_running_loop()
         try:
@@ -173,6 +310,12 @@ class StarlinkCollector(Collector):
 
     async def teardown(self):
         self._close()
+        if self._obstruction_file is not None:
+            try:
+                self._obstruction_file.close()
+            except Exception:
+                pass
+            self._obstruction_file = None
 
     # --- diagnostics -----------------------------------------------------
 
@@ -249,5 +392,36 @@ class StarlinkCollector(Collector):
             report["conclusion"] = (
                 "接続はできましたがステータスを取得できません。"
                 "エラー内容を確認してください"
+            )
+            return report
+
+        # the obstruction map is optional: report it, never fail on it
+        try:
+            raw = self.fetch_obstruction_map()
+            grid, grid_key, meta = self.split_obstruction_map(raw)
+            if grid:
+                blocked = sum(1 for v in grid if v > 0)
+                valid = sum(1 for v in grid if v >= 0)
+                step(
+                    "障害物マップ取得",
+                    True,
+                    f"{meta.get('num_rows', '?')}×{meta.get('num_cols', '?')} "
+                    f"({len(grid)}セル、フィールド名 '{grid_key}'、"
+                    f"観測済み {valid} セル中 {blocked} セルが遮蔽)",
+                )
+                report["obstruction_meta"] = meta
+            else:
+                step(
+                    "障害物マップ取得",
+                    False,
+                    "応答にグリッドが含まれていません(ファームウェア非対応)",
+                    level="注意",
+                )
+        except Exception as e:
+            step(
+                "障害物マップ取得",
+                False,
+                f"{compact(e)} — このディッシュでは利用できません",
+                level="注意",
             )
         return report

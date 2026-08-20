@@ -63,7 +63,7 @@ dialog::backdrop{background:rgba(0,0,0,.45)}
 <header>
   <h1>LEO データビューア</h1>
   <button id="pick" class="primary">データを選択…</button>
-  <input id="fileInput" type="file" multiple accept=".csv,.gz" hidden>
+  <input id="fileInput" type="file" multiple accept=".csv,.gz,.jsonl" hidden>
   <input id="dirInput" type="file" webkitdirectory directory hidden>
   <span id="srcName" class="muted">未選択</span>
   <span style="flex:1"></span>
@@ -102,6 +102,11 @@ dialog::backdrop{background:rgba(0,0,0,.45)}
       <span><span class="sw" style="background:var(--s4)"></span>SINR dB</span>
       <span class="muted">縦線=再生位置。クリックでその時刻へ移動</span>
     </div>
+    <div class="legend" id="hoLegend" style="display:none">
+      <span><span class="sw" style="background:var(--crit)"></span>15秒境界に乗った損失</span>
+      <span><span class="sw" style="background:var(--muted)"></span>それ以外の損失</span>
+      <span id="hoInfo" class="muted"></span>
+    </div>
   </section>
 
   <section class="card">
@@ -122,7 +127,39 @@ dialog::backdrop{background:rgba(0,0,0,.45)}
           <option value="25">25°</option><option value="40">40°</option>
         </select>
       </label>
+      <label class="muted" id="forWrap" style="display:none">視野範囲(目安)
+        <select id="forDeg">
+          <option value="0">表示しない</option>
+          <option value="40">±40°</option>
+          <option value="50" selected>±50°</option>
+          <option value="60">±60°</option>
+        </select>
+      </label>
       <span id="satInfo" class="muted"></span>
+    </div>
+  </section>
+
+  <section class="card" id="obsCard" style="display:none">
+    <h2>Starlink 障害物マップ(ディッシュ実測)</h2>
+    <canvas id="obs" height="440"></canvas>
+    <div class="row" style="margin-top:6px">
+      <label class="muted">回転
+        <select id="obsRot">
+          <option value="0" selected>0°</option><option value="90">90°</option>
+          <option value="180">180°</option><option value="270">270°</option>
+        </select>
+      </label>
+      <label class="muted"><input type="checkbox" id="obsFlip"> 左右反転</label>
+      <label class="muted"><input type="checkbox" id="obsRaw"> 正方グリッドのまま表示</label>
+      <span id="obsInfo" class="muted"></span>
+    </div>
+    <div class="legend">
+      <span><span class="sw" style="background:#2a78d6"></span>見通しあり</span>
+      <span><span class="sw" style="background:#d03b3b"></span>遮蔽</span>
+      <span><span class="sw" style="background:#d8d7d0"></span>未観測</span>
+      <span class="muted">ディッシュが自分で観測した方向別の遮蔽状況。
+        方角の対応は公式仕様が非公開のため北を上と仮定しています
+        (アプリの表示と見比べ、ずれていれば回転で合わせてください)</span>
     </div>
   </section>
 
@@ -206,7 +243,18 @@ const state = {
   run: null, idx: 0, playing: false, timer: null,
   home: null, homeManual: null, zoom: 8, sats: {}, rain: null,
   satAt: null, rainAt: null, pickMode: false,
+  // 障害物マップ(Starlink)と、15秒ハンドオーバー境界の集計
+  obs: { list: [], grids: new Map(), shown: -1, path: null, pending: false },
+  handover: null,
 };
+
+// StarlinkはUTCの15秒境界(:00/:15/:30/:45)で接続を組み替える。
+// 実測でも、損失はその直後2秒に強く集中する
+const HANDOVER_PERIOD_S = 15;
+const HANDOVER_WINDOW_S = 2;
+const inHandoverWindow = t =>
+  ((Math.floor(t) % HANDOVER_PERIOD_S) + HANDOVER_PERIOD_S) % HANDOVER_PERIOD_S
+    < HANDOVER_WINDOW_S;
 
 // サーバー(--viewer)経由か、HTMLを直接開いた単体モードか
 const SERVER_MODE = location.protocol === "http:" || location.protocol === "https:";
@@ -239,10 +287,42 @@ function applyRun(run) {
   state.zoom = autoZoom(run);
   state.sats = {}; state.rain = null; state.satAt = null; state.rainAt = null;
   state.liveHome = null; state.homeManual = null;   // 前回のデータを持ち越さない
+  const ho = state.handover = run.handover || null;
+  $("#hoLegend").style.display = ho ? "" : "none";
+  if (ho) {
+    $("#hoInfo").textContent =
+      `全データ集計: パケット損失 ${ho.total} 秒のうち ${ho.hit} 秒(${
+        (ho.share * 100).toFixed(0)}%)がUTC15秒境界の直後${HANDOVER_WINDOW_S}秒に発生` +
+      `(均一なら ${(ho.expected * 100).toFixed(0)}%、${(+ho.ratio).toFixed(1)}倍)。` +
+      "Starlinkは15秒ごとに接続を組み替えるため、集中していればハンドオーバー起因の可能性が高い" +
+      (run.step > 1 ? " / 帯の目盛は粒度を1秒にすると表示されます" : "");
+  }
+  if (!run.obsLocal) state.obs = { list: [], grids: new Map(), shown: -1,
+                                   path: run.path, pending: false };
+  else state.obs = { list: run.obsLocal.map((m, i) => ({ i, epoch: m.epoch,
+                       rows: m.rows, cols: m.cols, meta: m.meta || {} })),
+                     grids: new Map(run.obsLocal.map((m, i) => [i, m])),
+                     shown: -1, path: null, pending: false };
+  $("#forWrap").style.display =
+    run.series.starlink_az && run.series.starlink_az.some(v => v != null)
+      ? "" : "none";
+  updateObsCard();
+  if (SERVER_MODE && run.path) loadObstructionIndex(run.path);
   const src = run.sources.map(s => s.file).join(", ");
   setStatus("読み込み完了: " + src +
     (run.meta && run.meta.tool_version ? " / " + run.meta.tool_version : ""));
   render(true);
+}
+
+// 損失が15秒境界の直後に偏っているかを数える。偏っていれば、その時刻が
+// ハンドオーバーだった可能性が高い。必ず間引く前の全秒を渡すこと
+function handoverStats(lossSeconds) {
+  if (!lossSeconds || !lossSeconds.length) return null;
+  const hit = lossSeconds.filter(inHandoverWindow).length;
+  const expected = HANDOVER_WINDOW_S / HANDOVER_PERIOD_S;
+  const share = hit / lossSeconds.length;
+  return { total: lossSeconds.length, hit, share, expected,
+           ratio: share / expected };
 }
 
 function setStatus(t) { $("#status").textContent = t; }
@@ -301,10 +381,29 @@ const numOf = v => {
   if (v === "True" || v === "true") return 1; if (v === "False" || v === "false") return 0;
   const f = parseFloat(v); return Number.isFinite(f) ? f : null;
 };
-async function loadFiles(files) {
-  files = files.filter(f => /\.csv(\.gz)?$/i.test(f.name));
+// 単体モードでの障害物マップ。1枚15k個の数値なので、多いときは間引く
+const OBS_MAX_LOCAL = 300;
+async function parseObstruction(file) {
+  const lines = (await readTextFile(file)).split("\n").filter(l => l.trim());
+  const keep = Math.ceil(lines.length / OBS_MAX_LOCAL);
+  const out = [];
+  lines.forEach((line, i) => {
+    if (i % keep) return;
+    try { out.push(JSON.parse(line)); } catch (e) { /* 壊れた行は飛ばす */ }
+  });
+  return out;
+}
+
+async function loadFiles(all) {
+  const obsFiles = Array.from(all).filter(f => /obstruction.*\.jsonl(\.gz)?$/i.test(f.name));
+  const files = Array.from(all).filter(f => /\.csv(\.gz)?$/i.test(f.name));
   if (!files.length) { setStatus("CSVが見つかりませんでした"); return; }
   setStatus("読み込み中… (" + files.length + " ファイル)");
+  let obsLocal = null;
+  for (const f of obsFiles) {
+    try { obsLocal = (obsLocal || []).concat(await parseObstruction(f)); }
+    catch (e) { /* マップが読めなくても測定データの表示は続ける */ }
+  }
   const samples = new Map(), used = [];
   for (const file of files) {
     let rows;
@@ -330,6 +429,9 @@ async function loadFiles(files) {
     }
   }
   if (!samples.size) { setStatus("epoch列を持つCSVがありませんでした"); return; }
+  // 間引く前に集計する(10秒粒度は15秒周期とエイリアスして偽の集中を生む)
+  const handover = handoverStats([...samples.entries()]
+    .filter(([, s]) => s.loss > 0).map(([t]) => t));
   let times = [...samples.keys()].sort((a, b) => a - b);
   const step = +$("#step").value;
   if (step > 1) {
@@ -353,10 +455,11 @@ async function loadFiles(files) {
     home = { lat: mid, lon: pos.reduce((a, s) => a + s.lon, 0) / pos.length,
              moving: Math.hypot(ns, ew) > 50 };
   }
+  if (obsLocal) obsLocal.sort((a, b) => a.epoch - b.epoch);
   applyRun({ label: files[0].webkitRelativePath?.split("/")[0] || files[0].name,
              path: null, meta: {}, sources: used.map(f => ({ file: f })),
-             times, series, home, step });
-  state.lastFiles = files;
+             times, series, home, step, obsLocal, handover });
+  state.lastFiles = all;
 }
 
 // 走行範囲がちょうど収まるズーム(静止なら市街地スケール)
@@ -451,9 +554,121 @@ function render(initial) {
   updateHome();
   drawSky();
   drawMap();
+  drawObstruction();
   maybeFetchSats(t);
   maybeFetchRain(t);
 }
+
+// ---------- Starlink obstruction map ----------
+async function loadObstructionIndex(path) {
+  try {
+    const j = await api("/api/obstruction_index", { path });
+    state.obs.list = j.maps || [];
+    state.obs.path = path;
+  } catch (e) {
+    state.obs.list = [];
+  }
+  updateObsCard();
+  drawObstruction();
+}
+
+function updateObsCard() {
+  $("#obsCard").style.display = state.obs.list.length ? "" : "none";
+}
+
+// その時刻までに記録された最新のマップ(無ければ最初のもの)
+function obsIndexFor(t) {
+  const list = state.obs.list;
+  if (!list.length) return -1;
+  let pick = 0;
+  for (let i = 0; i < list.length; i++) if (list[i].epoch <= t) pick = i;
+  return pick;
+}
+
+function drawObstruction() {
+  if (!state.obs.list.length) return;
+  const want = obsIndexFor(state.run.times[state.idx]);
+  const entry = state.obs.list[want];
+  const grid = state.obs.grids.get(want);
+  if (!grid) {
+    if (!state.obs.pending && state.obs.path) {
+      state.obs.pending = true;
+      api("/api/obstruction", { path: state.obs.path, i: entry.i })
+        .then(rec => { state.obs.grids.set(want, rec); })
+        .catch(() => { state.obs.grids.set(want, { grid: [] }); })
+        .finally(() => { state.obs.pending = false; drawObstruction(); });
+    }
+    $("#obsInfo").textContent = "読み込み中…";
+    return;
+  }
+  state.obs.shown = want;
+  paintObstruction(grid, entry);
+}
+
+// グリッドをそのまま画像化して描く。セルと方角の対応は公式仕様が
+// 公開されていないため、角度への変換はせず「北が上」と仮定するだけ
+function paintObstruction(rec, entry) {
+  const [g, w, h] = fitCanvas($("#obs"), 440);
+  const cols = rec.cols || entry.cols || 0, rows = rec.rows || entry.rows || 0;
+  const grid = rec.grid || [];
+  if (!cols || !rows || grid.length < rows * cols) {
+    g.fillStyle = css("--muted"); g.font = "13px system-ui";
+    g.fillText("このマップは読み取れませんでした", 12, 24);
+    return;
+  }
+  const off = document.createElement("canvas");
+  off.width = cols; off.height = rows;
+  const ctx = off.getContext("2d");
+  const img = ctx.createImageData(cols, rows);
+  for (let k = 0; k < rows * cols; k++) {
+    const v = grid[k];
+    let r, gr, b;
+    if (v == null || v < 0) { r = 216; gr = 215; b = 208; }        // 未観測
+    else if (v <= 0) { r = 42; gr = 120; b = 214; }                // 見通しあり
+    else {                                                          // 遮蔽の度合い
+      const f = Math.min(1, v);
+      r = Math.round(42 + (208 - 42) * f);
+      gr = Math.round(120 + (59 - 120) * f);
+      b = Math.round(214 + (59 - 214) * f);
+    }
+    img.data[k * 4] = r; img.data[k * 4 + 1] = gr;
+    img.data[k * 4 + 2] = b; img.data[k * 4 + 3] = 255;
+  }
+  ctx.putImageData(img, 0, 0);
+
+  const R = Math.min(w, h) / 2 - 26, cx = w / 2, cy = h / 2;
+  const raw = $("#obsRaw").checked;
+  g.save();
+  if (!raw) { g.beginPath(); g.arc(cx, cy, R, 0, 7); g.clip(); }
+  g.translate(cx, cy);
+  g.rotate(+$("#obsRot").value * Math.PI / 180);
+  if ($("#obsFlip").checked) g.scale(-1, 1);
+  g.imageSmoothingEnabled = false;
+  g.drawImage(off, -R, -R, R * 2, R * 2);
+  g.restore();
+
+  g.strokeStyle = css("--axis"); g.lineWidth = 1;
+  if (raw) g.strokeRect(cx - R, cy - R, R * 2, R * 2);
+  else { g.beginPath(); g.arc(cx, cy, R, 0, 7); g.stroke(); }
+  g.fillStyle = css("--muted"); g.font = "12px system-ui";
+  g.textAlign = "center";
+  [["N", 0, -R - 10], ["S", 0, R + 16], ["E", R + 12, 4], ["W", -R - 12, 4]]
+    .forEach(([lbl, dx, dy]) => g.fillText(lbl, cx + dx, cy + dy));
+  g.textAlign = "left";
+
+  const valid = grid.filter(v => v >= 0).length;
+  const blocked = grid.filter(v => v > 0).length;
+  const el = entry.meta && entry.meta.min_elevation_deg;
+  $("#obsInfo").textContent =
+    `${fmtClock(entry.epoch).slice(11, 19)} 時点 / ${rows}×${cols} / ` +
+    `観測済み ${valid} セル中 ${blocked} セル(${
+      valid ? (blocked / valid * 100).toFixed(1) : "—"}%)が遮蔽` +
+    (el != null ? ` / 外周は仰角 ${(+el).toFixed(0)}° 付近` : "") +
+    ` / 全 ${state.obs.list.length} 枚中 ${state.obs.shown + 1} 枚目`;
+}
+["#obsRot", "#obsFlip", "#obsRaw"].forEach(sel => {
+  $(sel).onchange = () => drawObstruction();
+});
 
 function drawTiles() {
   const defs = [
@@ -486,6 +701,8 @@ function drawStrip() {
   const plot = { w: w - pad.l - pad.r, h: h - pad.t - pad.b };
   const chans = [["down_mbps", "--s1"], ["up_mbps", "--s2"],
                  ["rtt_ms", "--s3"], ["snr_db", "--s4"]];
+  const xOf = i => pad.l + plot.w * (i / Math.max(1, n - 1));
+  drawHandoverMarks(g, pad, plot, n, xOf);
   g.strokeStyle = css("--grid"); g.beginPath();
   g.moveTo(pad.l, pad.t + plot.h); g.lineTo(w - pad.r, pad.t + plot.h); g.stroke();
   chans.forEach(([key, col]) => {
@@ -511,6 +728,38 @@ function drawStrip() {
   g.fillText(fmtClock(state.run.times[n - 1]).slice(5, 16), w - pad.r, h - 4);
   g.textAlign = "left";
 }
+// 15秒境界(ハンドオーバー窓)と、そこに乗った損失を帯の下端に描く
+function drawHandoverMarks(g, pad, plot, n, xOf) {
+  // 間引かれた表示では境界に乗ったかどうかを判定できない(15秒周期との
+  // エイリアス)ので、1秒粒度のときだけ描く。集計値は別途全データで出す
+  if (!state.handover || (state.run.step || 1) > 1) return;
+  const times = state.run.times;
+  const loss = state.run.series.loss || [];
+  // 境界線はStarlinkのデータがある区間だけ。他アンテナの区間に引くと
+  // その回線にも15秒周期があるように見えてしまう
+  const span = state.run.series.starlink_el || loss;
+  const first = span.findIndex(v => v != null);
+  let last = -1;
+  for (let i = span.length - 1; i >= 0; i--) if (span[i] != null) { last = i; break; }
+  const pxPerCycle = plot.w / Math.max(1, n - 1) * HANDOVER_PERIOD_S;
+  if (first >= 0 && pxPerCycle >= 4) {   // 詰まりすぎるときは線を描かない
+    g.strokeStyle = css("--grid"); g.lineWidth = 1;
+    g.beginPath();
+    for (let i = first; i <= last; i++) {
+      if (!inHandoverWindow(times[i]) || inHandoverWindow(times[i - 1])) continue;
+      const x = Math.round(xOf(i)) + .5;
+      g.moveTo(x, pad.t); g.lineTo(x, pad.t + plot.h);
+    }
+    g.stroke();
+  }
+  const y = pad.t + plot.h;
+  times.forEach((t, i) => {
+    if (!(loss[i] > 0)) return;
+    g.fillStyle = inHandoverWindow(t) ? css("--crit") : css("--muted");
+    g.fillRect(xOf(i) - 1, y - 5, 2, 5);
+  });
+}
+
 $("#strip").onclick = e => {
   if (!state.run) return;
   const r = e.target.getBoundingClientRect();
@@ -558,6 +807,8 @@ function drawSky() {
     g.stroke(); g.globalAlpha = 1;
   });
 
+  drawFieldOfRegard(g, project);
+
   const colors = { starlink: css("--s1"), oneweb: css("--s2") };
   Object.entries(state.sats).forEach(([group, list]) => {
     g.fillStyle = colors[group] || css("--s3");
@@ -599,6 +850,34 @@ function drawSky() {
     g.fillText(`${label} ${azDeg.toFixed(0)}°/${el.toFixed(0)}°`, x + 12, y + 4);
   });
 }
+
+// 設置姿勢を中心とした視野範囲。Starlinkは接続中の衛星を公開しないので、
+// 「この範囲のどれか」までしか言えない。その範囲を明示するための表示
+function drawFieldOfRegard(g, project) {
+  const half = +$("#forDeg").value;
+  if (!half) return;
+  const az0 = nearest("starlink_az", state.idx);
+  const el0 = nearest("starlink_el", state.idx);
+  if (az0 == null || el0 == null) return;
+  const rad = Math.PI / 180;
+  const e0 = el0 * rad, sinE0 = Math.sin(e0), cosE0 = Math.cos(e0);
+  const th = half * rad, sinT = Math.sin(th), cosT = Math.cos(th);
+  g.strokeStyle = css("--muted"); g.lineWidth = 1;
+  g.setLineDash([3, 4]); g.globalAlpha = .8;
+  g.beginPath();
+  let pen = false;
+  for (let b = 0; b <= 360; b += 4) {   // 円錐の縁を球面三角法でたどる
+    const br = b * rad;
+    const el = Math.asin(sinE0 * cosT + cosE0 * sinT * Math.cos(br));
+    if (el < 0) { pen = false; continue; }
+    const az = az0 + Math.atan2(Math.sin(br) * sinT * cosE0,
+                                cosT - sinE0 * Math.sin(el)) / rad;
+    const [x, y] = project(az, el / rad);
+    pen ? g.lineTo(x, y) : g.moveTo(x, y); pen = true;
+  }
+  g.stroke(); g.setLineDash([]); g.globalAlpha = 1;
+}
+$("#forDeg").onchange = () => render();
 
 // 角距離が最小の衛星(= 指向先の候補)
 function nearestSat(az, el) {
@@ -695,8 +974,28 @@ async function maybeFetchSats(t) {
       state.sats = sats;
       $("#satInfo").textContent = parts.join(" / ") + "(TLEは最新版)";
     }
+    const inFor = countInFieldOfRegard();
+    if (inFor != null) {
+      $("#satInfo").textContent += ` / 視野範囲内 ${inFor} 機(この中のどれかに接続)`;
+    }
     drawSky();
   } catch (e) { $("#satInfo").textContent = "衛星: " + e.message; }
+}
+
+// 視野範囲内のStarlink衛星数。1機に絞れないことを数字で示すための表示
+function countInFieldOfRegard() {
+  const half = +$("#forDeg").value;
+  const az0 = nearest("starlink_az", state.idx);
+  const el0 = nearest("starlink_el", state.idx);
+  if (!half || az0 == null || el0 == null) return null;
+  const rad = Math.PI / 180;
+  const v = (a, e) => [Math.cos(e * rad) * Math.cos(a * rad),
+                       Math.cos(e * rad) * Math.sin(a * rad), Math.sin(e * rad)];
+  const b = v(az0, el0), lim = Math.cos(half * rad);
+  return (state.sats.starlink || []).filter(s => {
+    const q = v(s.az, s.el);
+    return b[0] * q[0] + b[1] * q[1] + b[2] * q[2] >= lim;
+  }).length;
 }
 $("#minEl").onchange = () => { state.satAt = null; render(); };
 
