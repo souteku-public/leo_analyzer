@@ -115,6 +115,35 @@ HANDOVER_PERIOD_S = 15
 HANDOVER_WINDOW_S = 2
 
 
+# Throughput only means something inside its own phase: averaging the
+# download rate across the idle baseline and the upload run buries it.
+STAT_KEYS = ["down_mbps", "up_mbps", "rtt_ms", "snr_db", "loss", "speed"]
+STAT_PHASE = {"down_mbps": "download", "up_mbps": "upload"}
+
+
+def _series_stats(samples: dict):
+    """Mean/min/max per channel over every sample, before any thinning."""
+    out = {}
+    for key in STAT_KEYS:
+        phase = STAT_PHASE.get(key)
+        rows = samples.values()
+        used_phase = None
+        if phase and any(r.get("phase") == phase for r in rows):
+            rows = [r for r in samples.values() if r.get("phase") == phase]
+            used_phase = phase
+        values = [r[key] for r in rows if r.get(key) is not None]
+        if not values:
+            continue
+        out[key] = {
+            "mean": sum(values) / len(values),
+            "min": min(values),
+            "max": max(values),
+            "n": len(values),
+            "phase": used_phase,
+        }
+    return out
+
+
 def _handover_stats(samples: dict):
     """How much of the packet loss sits in the 15-second handover window.
 
@@ -274,6 +303,7 @@ def load_run(target: str, step: int = 1):
         raise ValueError("epoch 列を持つCSVが見つかりませんでした")
 
     handover = _handover_stats(samples)
+    stats = _series_stats(samples)
 
     times = sorted(samples)
     if step > 1:  # thin to the requested granularity
@@ -321,4 +351,5 @@ def load_run(target: str, step: int = 1):
         "home": home,
         "step": step,
         "handover": handover,
+        "stats": stats,
     }

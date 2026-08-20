@@ -100,8 +100,10 @@ dialog::backdrop{background:rgba(0,0,0,.45)}
       <span><span class="sw" style="background:var(--s2)"></span>上り Mbps</span>
       <span><span class="sw" style="background:var(--s3)"></span>RTT ms</span>
       <span><span class="sw" style="background:var(--s4)"></span>SINR dB</span>
-      <span class="muted">縦線=再生位置。クリックでその時刻へ移動</span>
+      <span class="muted">縦線=再生位置。クリックでその時刻へ移動。
+        横の破線=その系列の平均</span>
     </div>
+    <div class="legend"><span id="statsInfo" class="muted"></span></div>
     <div class="legend" id="hoLegend" style="display:none">
       <span><span class="sw" style="background:var(--crit)"></span>15秒境界に乗った損失</span>
       <span><span class="sw" style="background:var(--muted)"></span>それ以外の損失</span>
@@ -287,6 +289,7 @@ function applyRun(run) {
   state.zoom = autoZoom(run);
   state.sats = {}; state.rain = null; state.satAt = null; state.rainAt = null;
   state.liveHome = null; state.homeManual = null;   // 前回のデータを持ち越さない
+  $("#statsInfo").textContent = statsLine(run);
   const ho = state.handover = run.handover || null;
   $("#hoLegend").style.display = ho ? "" : "none";
   if (ho) {
@@ -312,6 +315,27 @@ function applyRun(run) {
   setStatus("読み込み完了: " + src +
     (run.meta && run.meta.tool_version ? " / " + run.meta.tool_version : ""));
   render(true);
+}
+
+// スループットは自分のフェーズの中でしか意味を持たない。下りの平均を
+// アイドル区間や上り区間まで含めて取ると本来の値が埋もれる
+const STAT_PHASE = { down_mbps: "download", up_mbps: "upload" };
+const STAT_KEYS = ["down_mbps", "up_mbps", "rtt_ms", "snr_db", "loss", "speed"];
+
+// 平均・最大・最小。必ず間引く前の全サンプルを渡すこと
+function seriesStats(rows) {
+  const out = {};
+  for (const key of STAT_KEYS) {
+    const phase = STAT_PHASE[key];
+    const usePhase = phase && rows.some(r => r.phase === phase);
+    const src = usePhase ? rows.filter(r => r.phase === phase) : rows;
+    const v = src.map(r => r[key]).filter(x => x != null);
+    if (!v.length) continue;
+    out[key] = { mean: v.reduce((a, b) => a + b, 0) / v.length,
+                 min: Math.min(...v), max: Math.max(...v), n: v.length,
+                 phase: usePhase ? phase : null };
+  }
+  return out;
 }
 
 // 損失が15秒境界の直後に偏っているかを数える。偏っていれば、その時刻が
@@ -418,7 +442,8 @@ async function loadFiles(all) {
     }
     used.push(file.name);
     for (const r of rows) {
-      const t = Math.round(numOf(r.epoch)); if (!Number.isFinite(t)) continue;
+      // floor で揃える(サーバー側は int() なので round だと秒がずれる)
+      const t = Math.floor(numOf(r.epoch)); if (!Number.isFinite(t)) continue;
       const slot = samples.get(t) || samples.set(t, {}).get(t);
       for (const [key, col] of Object.entries(pick)) {
         let v = numOf(r[col]); if (v == null) continue;
@@ -432,6 +457,7 @@ async function loadFiles(all) {
   // 間引く前に集計する(10秒粒度は15秒周期とエイリアスして偽の集中を生む)
   const handover = handoverStats([...samples.entries()]
     .filter(([, s]) => s.loss > 0).map(([t]) => t));
+  const stats = seriesStats([...samples.values()]);
   let times = [...samples.keys()].sort((a, b) => a - b);
   const step = +$("#step").value;
   if (step > 1) {
@@ -458,7 +484,7 @@ async function loadFiles(all) {
   if (obsLocal) obsLocal.sort((a, b) => a.epoch - b.epoch);
   applyRun({ label: files[0].webkitRelativePath?.split("/")[0] || files[0].name,
              path: null, meta: {}, sources: used.map(f => ({ file: f })),
-             times, series, home, step, obsLocal, handover });
+             times, series, home, step, obsLocal, handover, stats });
   state.lastFiles = all;
 }
 
@@ -670,16 +696,42 @@ function paintObstruction(rec, entry) {
   $(sel).onchange = () => drawObstruction();
 });
 
+const STAT_LABEL = { down_mbps: ["下り", "Mbps"], up_mbps: ["上り", "Mbps"],
+                     rtt_ms: ["RTT", "ms"], snr_db: ["SINR", "dB"],
+                     // ロス率は0の秒が記録されないので、平均は「損失が
+                     // 出た秒だけ」の平均になる。誤読しないよう明示する
+                     loss: ["ロス率(発生秒のみ)", ""], speed: ["速度", "m/s"] };
+const fmtVal = (v, unit) => (+v).toFixed(unit === "Mbps" ? 1 : unit === "" ? 3 : 2);
+
 function drawTiles() {
-  const defs = [
-    ["下り", cur("down_mbps"), "Mbps"], ["上り", cur("up_mbps"), "Mbps"],
-    ["RTT", cur("rtt_ms"), "ms"], ["SINR", cur("snr_db"), "dB"],
-    ["速度", cur("speed"), "m/s"],
-  ];
-  $("#tiles").innerHTML = defs.filter(d => d[1] != null).map(d =>
-    `<div class="tile"><div class="k">${d[0]}</div><div class="v">${
-      (+d[1]).toFixed(d[2] === "Mbps" ? 1 : 2)}<span class="u">${d[2]}</span></div></div>`
-  ).join("") || '<span class="muted">この時刻のデータはありません</span>';
+  const stats = state.run.stats || {};
+  // 現在値と、その系列の全区間平均を並べる。平均は間引きの影響を受けない
+  const tiles = ["down_mbps", "up_mbps", "rtt_ms", "snr_db", "speed"]
+    .map(key => {
+      const now = cur(key), st = stats[key];
+      if (now == null && !st) return "";
+      const [label, unit] = STAT_LABEL[key];
+      const avg = st
+        ? `<div class="k">平均 ${fmtVal(st.mean, unit)}` +
+          `<span class="u">${unit}</span></div>` : "";
+      return `<div class="tile"><div class="k">${label}</div><div class="v">${
+        now == null ? "—" : fmtVal(now, unit)
+      }<span class="u">${unit}</span></div>${avg}</div>`;
+    }).join("");
+  $("#tiles").innerHTML = tiles ||
+    '<span class="muted">この時刻のデータはありません</span>';
+}
+
+// グラフ下に平均値をテキストでも出す(最大・最小つき)
+function statsLine(run) {
+  const stats = run.stats || {};
+  const parts = STAT_KEYS.filter(k => stats[k]).map(key => {
+    const st = stats[key], [label, unit] = STAT_LABEL[key];
+    return `${label} 平均 ${fmtVal(st.mean, unit)}${unit}` +
+           `(最小 ${fmtVal(st.min, unit)} / 最大 ${fmtVal(st.max, unit)}` +
+           `${st.phase ? " / " + st.phase + "区間" : ""} / ${st.n}秒)`;
+  });
+  return parts.length ? "平均値: " + parts.join(" ・ ") : "";
 }
 
 function fitCanvas(c, h) {
@@ -705,10 +757,23 @@ function drawStrip() {
   drawHandoverMarks(g, pad, plot, n, xOf);
   g.strokeStyle = css("--grid"); g.beginPath();
   g.moveTo(pad.l, pad.t + plot.h); g.lineTo(w - pad.r, pad.t + plot.h); g.stroke();
-  chans.forEach(([key, col]) => {
+  const stats = state.run.stats || {};
+  chans.forEach(([key, col], ci) => {
     const s = state.run.series[key]; if (!s || !s.some(v => v != null)) return;
     const vals = s.filter(v => v != null);
     const max = Math.max(...vals) || 1;
+    const st = stats[key];
+    if (st && st.mean <= max) {   // 平均を同じスケールの水平破線で重ねる
+      const y = pad.t + plot.h * (1 - st.mean / max);
+      g.strokeStyle = css(col); g.lineWidth = 1;
+      g.setLineDash([5, 4]); g.globalAlpha = .55;
+      g.beginPath(); g.moveTo(pad.l, y); g.lineTo(w - pad.r, y); g.stroke();
+      g.setLineDash([]); g.globalAlpha = 1;
+      g.fillStyle = css(col); g.font = "10px system-ui";
+      // 系列ごとに横位置と上下をずらす(平均が近いとラベルが重なるため)
+      g.fillText("平均 " + fmtVal(st.mean, STAT_LABEL[key][1]),
+                 pad.l + 4 + ci * 96, y + (ci % 2 ? 10 : -3));
+    }
     g.strokeStyle = css(col); g.lineWidth = 1.5; g.beginPath();
     let pen = false;
     s.forEach((v, i) => {
