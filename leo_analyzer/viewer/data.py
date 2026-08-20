@@ -109,8 +109,10 @@ def _csv_files(target: Path):
     return [f for f in files if not f.name.endswith("_slim.csv") or len(files) == 1]
 
 
-# Starlink reconfigures on UTC 15-second boundaries, so packet loss caused
-# by a handover lands in the first seconds of each cycle.
+# Starlink schedules on a 15-second grid aligned to UTC, so a switch can
+# only start on one of those boundaries. It does NOT switch on every
+# boundary — most are passed without any disruption — so the useful figure
+# is what share of boundaries carried loss, not "one handover per 15 s".
 HANDOVER_PERIOD_S = 15
 HANDOVER_WINDOW_S = 2
 
@@ -145,11 +147,16 @@ def _series_stats(samples: dict):
 
 
 def _handover_stats(samples: dict):
-    """How much of the packet loss sits in the 15-second handover window.
+    """How packet loss lines up with the 15-second scheduling grid.
 
     Computed on every sample, before the display granularity thins the
     series — sampling every 10th second would alias against the 15-second
     period and invent a concentration that is not there.
+
+    Reports two different things, which are easy to confuse:
+      share    — of the seconds that had loss, how many sat on a boundary
+      occupied — of the boundaries in the run, how many carried loss
+    The second one is what says whether a switch happens every 15 seconds.
     """
     seconds = [t for t, row in samples.items() if (row.get("loss") or 0) > 0]
     if not seconds:
@@ -157,12 +164,26 @@ def _handover_stats(samples: dict):
     hit = sum(1 for t in seconds if t % HANDOVER_PERIOD_S < HANDOVER_WINDOW_S)
     expected = HANDOVER_WINDOW_S / HANDOVER_PERIOD_S
     share = hit / len(seconds)
+
+    lossy = {t for t in seconds}
+    span = [t for t, row in samples.items() if row.get("loss") is not None
+            or row.get("rtt_ms") is not None]
+    boundaries, occupied = 0, 0
+    if span:
+        first, last = min(span), max(span)
+        for b in range((first // HANDOVER_PERIOD_S + 1) * HANDOVER_PERIOD_S,
+                       last, HANDOVER_PERIOD_S):
+            boundaries += 1
+            if any(b + d in lossy for d in range(HANDOVER_WINDOW_S)):
+                occupied += 1
     return {
         "total": len(seconds),
         "hit": hit,
         "share": round(share, 4),
         "expected": round(expected, 4),
         "ratio": round(share / expected, 2),
+        "boundaries": boundaries,
+        "occupied": occupied,
     }
 
 

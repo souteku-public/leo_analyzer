@@ -105,7 +105,9 @@ dialog::backdrop{background:rgba(0,0,0,.45)}
     </div>
     <div class="legend"><span id="statsInfo" class="muted"></span></div>
     <div class="legend" id="hoLegend" style="display:none">
-      <span><span class="sw" style="background:var(--crit)"></span>15秒境界に乗った損失</span>
+      <label class="muted"><input type="checkbox" id="hoShow" checked>
+        15秒スロット境界を表示</label>
+      <span><span class="sw" style="background:var(--crit)"></span>境界に乗った損失</span>
       <span><span class="sw" style="background:var(--muted)"></span>それ以外の損失</span>
       <span id="hoInfo" class="muted"></span>
     </div>
@@ -250,8 +252,9 @@ const state = {
   handover: null,
 };
 
-// StarlinkはUTCの15秒境界(:00/:15/:30/:45)で接続を組み替える。
-// 実測でも、損失はその直後2秒に強く集中する
+// StarlinkはUTCの15秒グリッド(:00/:15/:30/:45)でスケジューリングしており、
+// 切り替えはその境界でしか始まらない。ただし「15秒ごとに必ず切り替わる」
+// わけではなく、多くの境界は何事もなく通過する
 const HANDOVER_PERIOD_S = 15;
 const HANDOVER_WINDOW_S = 2;
 const inHandoverWindow = t =>
@@ -294,11 +297,17 @@ function applyRun(run) {
   $("#hoLegend").style.display = ho ? "" : "none";
   if (ho) {
     $("#hoInfo").textContent =
-      `全データ集計: パケット損失 ${ho.total} 秒のうち ${ho.hit} 秒(${
-        (ho.share * 100).toFixed(0)}%)がUTC15秒境界の直後${HANDOVER_WINDOW_S}秒に発生` +
+      `全データ集計: 損失 ${ho.total} 秒のうち ${ho.hit} 秒(${
+        (ho.share * 100).toFixed(0)}%)がUTC15秒境界の直後${HANDOVER_WINDOW_S}秒に集中` +
       `(均一なら ${(ho.expected * 100).toFixed(0)}%、${(+ho.ratio).toFixed(1)}倍)。` +
-      "Starlinkは15秒ごとに接続を組み替えるため、集中していればハンドオーバー起因の可能性が高い" +
-      (run.step > 1 ? " / 帯の目盛は粒度を1秒にすると表示されます" : "");
+      (ho.boundaries
+        ? ` ただし境界 ${ho.boundaries} 個のうち損失を伴ったのは ${ho.occupied} 個(${
+            (ho.occupied / ho.boundaries * 100).toFixed(0)}%)で、` +
+          "15秒ごとに必ず切り替わるわけではありません。"
+        : " ") +
+      "Starlinkの切り替えは15秒グリッド上でのみ始まるため、境界に乗った損失は" +
+      "切り替え起因の可能性が高いという見方をします" +
+      (run.step > 1 ? " / 境界線と目盛は粒度を1秒にすると表示されます" : "");
   }
   if (!run.obsLocal) state.obs = { list: [], grids: new Map(), shown: -1,
                                    path: run.path, pending: false };
@@ -338,15 +347,28 @@ function seriesStats(rows) {
   return out;
 }
 
-// 損失が15秒境界の直後に偏っているかを数える。偏っていれば、その時刻が
-// ハンドオーバーだった可能性が高い。必ず間引く前の全秒を渡すこと
-function handoverStats(lossSeconds) {
+// 損失と15秒グリッドの関係。混同しやすい2つを別々に出す:
+//   share    … 損失した秒のうち、境界に乗っていた割合
+//   occupied … 全境界のうち、損失を伴った境界の割合(切り替え頻度の指標)
+// 必ず間引く前の全秒を渡すこと
+function handoverStats(lossSeconds, spanSeconds) {
   if (!lossSeconds || !lossSeconds.length) return null;
   const hit = lossSeconds.filter(inHandoverWindow).length;
   const expected = HANDOVER_WINDOW_S / HANDOVER_PERIOD_S;
   const share = hit / lossSeconds.length;
+  const lossy = new Set(lossSeconds);
+  let boundaries = 0, occupied = 0;
+  if (spanSeconds && spanSeconds.length) {
+    const first = Math.min(...spanSeconds), last = Math.max(...spanSeconds);
+    for (let b = (Math.floor(first / HANDOVER_PERIOD_S) + 1) * HANDOVER_PERIOD_S;
+         b < last; b += HANDOVER_PERIOD_S) {
+      boundaries++;
+      for (let d = 0; d < HANDOVER_WINDOW_S; d++)
+        if (lossy.has(b + d)) { occupied++; break; }
+    }
+  }
   return { total: lossSeconds.length, hit, share, expected,
-           ratio: share / expected };
+           ratio: share / expected, boundaries, occupied };
 }
 
 function setStatus(t) { $("#status").textContent = t; }
@@ -455,8 +477,10 @@ async function loadFiles(all) {
   }
   if (!samples.size) { setStatus("epoch列を持つCSVがありませんでした"); return; }
   // 間引く前に集計する(10秒粒度は15秒周期とエイリアスして偽の集中を生む)
-  const handover = handoverStats([...samples.entries()]
-    .filter(([, s]) => s.loss > 0).map(([t]) => t));
+  const handover = handoverStats(
+    [...samples.entries()].filter(([, s]) => s.loss > 0).map(([t]) => t),
+    [...samples.entries()].filter(([, s]) => s.loss != null || s.rtt_ms != null)
+      .map(([t]) => t));
   const stats = seriesStats([...samples.values()]);
   let times = [...samples.keys()].sort((a, b) => a - b);
   const step = +$("#step").value;
@@ -807,7 +831,7 @@ function drawHandoverMarks(g, pad, plot, n, xOf) {
   let last = -1;
   for (let i = span.length - 1; i >= 0; i--) if (span[i] != null) { last = i; break; }
   const pxPerCycle = plot.w / Math.max(1, n - 1) * HANDOVER_PERIOD_S;
-  if (first >= 0 && pxPerCycle >= 4) {   // 詰まりすぎるときは線を描かない
+  if (first >= 0 && pxPerCycle >= 4 && $("#hoShow").checked) {
     g.strokeStyle = css("--grid"); g.lineWidth = 1;
     g.beginPath();
     for (let i = first; i <= last; i++) {
@@ -824,6 +848,8 @@ function drawHandoverMarks(g, pad, plot, n, xOf) {
     g.fillRect(xOf(i) - 1, y - 5, 2, 5);
   });
 }
+
+$("#hoShow").onchange = () => render();
 
 $("#strip").onclick = e => {
   if (!state.run) return;
