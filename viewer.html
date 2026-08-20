@@ -65,6 +65,8 @@ dialog::backdrop{background:rgba(0,0,0,.45)}
   <button id="pick" class="primary">データを選択…</button>
   <input id="fileInput" type="file" multiple accept=".csv,.gz,.jsonl,.json" hidden>
   <input id="dirInput" type="file" webkitdirectory directory hidden>
+  <button id="bldPick" title="PLATEAUのCityGML(.gml)か、変換済みのbuildings.json">建物(PLATEAU)…</button>
+  <input id="bldInput" type="file" multiple accept=".gml,.json" hidden>
   <span id="srcName" class="muted">未選択</span>
   <span style="flex:1"></span>
   <label class="muted">粒度
@@ -193,6 +195,10 @@ dialog::backdrop{background:rgba(0,0,0,.45)}
                style="width:64px"> °
       </label>
       <label class="muted"><input type="checkbox" id="povLabels" checked> 建物の高さ</label>
+      <span style="flex:1"></span>
+      <button id="calcClear" title="全区間の遮蔽を計算し、グラフと平均値に反映します">全区間の遮蔽を計算</button>
+      <button id="saveBld" title="次回はこのファイルを選べば、CityGMLの変換をやり直さずに済みます">buildings.json を保存</button>
+      <button id="saveClear" title="Excelで開ける秒ごとの遮蔽判定">遮蔽判定CSVを保存</button>
     </div>
     <div class="muted" id="povInfo" style="margin-top:6px"></div>
   </section>
@@ -363,12 +369,16 @@ function applyRun(run) {
       ? "" : "none";
   updateObsCard();
   state.track = buildTrack(run);
-  applyBuildings(run.bldLocal ? { buildings: run.bldLocal.buildings,
-                                  meta: run.bldLocal.meta } : null);
-  if (SERVER_MODE && run.path) {
-    loadObstructionIndex(run.path);
+  if (run.bldLocal) {
+    applyBuildings(run.bldLocal);
+  } else if (SERVER_MODE && run.path) {
     loadBuildings(run.path);
+  } else {
+    // 粒度を変えるたびに再読込が走るので、手で読み込んだ建物は捨てない
+    applyBuildings(state.bld.list.length
+      ? { buildings: state.bld.list, meta: state.bld.meta } : null);
   }
+  if (SERVER_MODE && run.path) loadObstructionIndex(run.path);
   const src = run.sources.map(s => s.file).join(", ");
   setStatus("読み込み完了: " + src +
     (run.meta && run.meta.tool_version ? " / " + run.meta.tool_version : ""));
@@ -968,6 +978,216 @@ function drawSkyline() {
 ["#povFov", "#povH", "#povHpbw", "#povLabels"].forEach(sel => {
   $(sel).onchange = () => { drawPOV(); drawSkyline(); drawTiles(); };
 });
+
+// ---------- CityGML をブラウザだけで読む ----------
+// PLATEAUの1メッシュは数百MBになるので DOMParser は使えない。
+// <bldg:Building> ブロックだけをストリームから拾って走行範囲で捨てる
+const GML_OPEN = "<bldg:Building", GML_CLOSE = "</bldg:Building>";
+const POSLIST_RX = /<[A-Za-z0-9]*:?posList([^>]*)>([\s\S]*?)<\//g;
+const HEIGHT_RX = /<[A-Za-z0-9]*:?measuredHeight[^>]*>([^<]+)</;
+
+function parseBuildingBlock(text) {
+  const rings = [];
+  POSLIST_RX.lastIndex = 0;
+  let m;
+  while ((m = POSLIST_RX.exec(text))) {
+    const dim = /srsDimension\s*=\s*"(\d+)"/.exec(m[1]);
+    if (dim && dim[1] !== "3") continue;      // 2次元のフットプリントは使わない
+    const nums = m[2].trim().split(/\s+/);
+    if (nums.length < 12) continue;
+    const ring = [];
+    for (let k = 0; k + 2 < nums.length; k += 3)
+      ring.push([+nums[k], +nums[k + 1], +nums[k + 2]]);   // EPSG:6697 は緯度が先
+    if (ring.length >= 4 && ring.every(p => Number.isFinite(p[2]))) rings.push(ring);
+  }
+  if (!rings.length) return null;
+  let ground = rings[0], gz = Infinity, top = -Infinity;
+  for (const r of rings) {
+    const z = r.reduce((a, p) => a + p[2], 0) / r.length;
+    if (z < gz) { gz = z; ground = r; }
+    for (const p of r) if (p[2] > top) top = p[2];
+  }
+  const hm = HEIGHT_RX.exec(text);
+  let h = hm ? parseFloat(hm[1]) : NaN;
+  if (!(h > 0)) h = top - gz;
+  if (!(h > 0)) return null;
+  const poly = ground.map(p => [+p[0].toFixed(7), +p[1].toFixed(7)]);
+  if (poly.length > 1 && poly[0][0] === poly[poly.length - 1][0]
+      && poly[0][1] === poly[poly.length - 1][1]) poly.pop();
+  if (poly.length < 3) return null;
+  return { poly, z0: +gz.toFixed(2), h: +h.toFixed(2) };
+}
+
+function polyInBBox(poly, bb) {
+  let la0 = 90, lo0 = 180, la1 = -90, lo1 = -180;
+  for (const p of poly) {
+    if (p[0] < la0) la0 = p[0]; if (p[0] > la1) la1 = p[0];
+    if (p[1] < lo0) lo0 = p[1]; if (p[1] > lo1) lo1 = p[1];
+  }
+  return !(la1 < bb[0] || la0 > bb[2] || lo1 < bb[1] || lo0 > bb[3]);
+}
+
+function trackBBox(fixes, marginM) {
+  let la0 = 90, lo0 = 180, la1 = -90, lo1 = -180, sum = 0;
+  for (const [la, lo] of fixes) {
+    if (la < la0) la0 = la; if (la > la1) la1 = la;
+    if (lo < lo0) lo0 = lo; if (lo > lo1) lo1 = lo;
+    sum += la;
+  }
+  const mid = sum / fixes.length;
+  const dla = marginM / M_LAT, dlo = marginM / mPerLon(mid);
+  return [la0 - dla, lo0 - dlo, la1 + dla, lo1 + dlo];
+}
+
+async function scanCityGML(file, bbox, out, onProgress) {
+  if (!("TextDecoderStream" in window)) {
+    throw new Error("このブラウザでは大きなGMLを扱えません(Chrome/Edgeをお使いください)");
+  }
+  const reader = file.stream().pipeThrough(new TextDecoderStream("utf-8")).getReader();
+  let buf = "", bytes = 0, scanned = 0, kept = 0, tick = 0;
+  for (;;) {
+    const { done, value } = await reader.read();
+    if (value) { buf += value; bytes += value.length; }
+    for (;;) {
+      const i = buf.indexOf(GML_OPEN);
+      if (i === -1) break;
+      const j = buf.indexOf(GML_CLOSE, i);
+      if (j === -1) break;
+      const block = buf.slice(i, j + GML_CLOSE.length);
+      buf = buf.slice(j + GML_CLOSE.length);
+      scanned++;
+      const b = parseBuildingBlock(block);
+      if (b && polyInBBox(b.poly, bbox)) { out.push(b); kept++; }
+    }
+    // 建物の途中でなければバッファは捨ててよい(タグ境界ぶんだけ残す)
+    const i = buf.indexOf(GML_OPEN);
+    if (i === -1) buf = buf.slice(-GML_OPEN.length);
+    else if (i > 0) buf = buf.slice(i);
+    if (++tick % 12 === 0) {
+      onProgress(`${file.name}: ${(bytes / 1e6).toFixed(0)}MB 解析 / `
+        + `${scanned} 棟走査 / ${kept} 棟採用`);
+      await new Promise(r => setTimeout(r));   // 画面を固まらせない
+    }
+    if (done) break;
+  }
+  return { scanned, kept };
+}
+
+async function loadCityGML(files) {
+  files = Array.from(files);
+  if (!files.length) return;
+  const json = files.filter(f => /\.json$/i.test(f.name));
+  const gml = files.filter(f => /\.gml$/i.test(f.name));
+  if (json.length) {          // 変換済みならそのまま
+    try {
+      const payload = JSON.parse(await json[0].text());
+      applyBuildings(payload);
+      setStatus(`建物データを読み込みました: ${payload.count || (payload.buildings || []).length} 棟`);
+    } catch (e) { setStatus("buildings.json を読めませんでした: " + e.message); }
+    return;
+  }
+  if (!state.run || !state.track) {
+    setStatus("先に測定データ(CSV)を読み込んでください。走行範囲が分からないと切り出せません");
+    return;
+  }
+  const fixes = state.track.filter(Boolean);
+  if (!fixes.length) {
+    setStatus("この測定には位置情報がないため、建物との照合ができません");
+    return;
+  }
+  const bbox = trackBBox(fixes, 500);
+  const out = [];
+  let scanned = 0;
+  try {
+    for (const f of gml) {
+      const r = await scanCityGML(f, bbox, out, setStatus);
+      scanned += r.scanned;
+    }
+  } catch (e) {
+    setStatus("CityGMLの解析に失敗しました: " + e.message);
+    return;
+  }
+  applyBuildings({ buildings: out, count: out.length,
+    meta: { source: gml.map(f => f.name).join(", "),
+            antenna_height_m: +$("#povH").value || 2.6, bbox } });
+  setStatus(`CityGML ${gml.length} ファイル: ${scanned} 棟を走査し、`
+    + `走行範囲の ${out.length} 棟を採用しました`
+    + (out.length ? "(buildings.json に保存しておくと次回が速くなります)"
+                  : " — 範囲内に建物がありません。対象メッシュを確認してください"));
+}
+
+function download(name, text, type) {
+  const url = URL.createObjectURL(new Blob([text], { type }));
+  const a = document.createElement("a");
+  a.href = url; a.download = name; a.click();
+  setTimeout(() => URL.revokeObjectURL(url), 1000);
+}
+
+// 全区間の遮蔽判定。長い測定では時間がかかるので分割して進捗を出す
+function computeClearanceAll(done) {
+  const S = state.run.series, T = state.run.times;
+  const antennaH = +$("#povH").value || 2.6;
+  const clear = new Array(T.length).fill(null);
+  const rows = [["epoch", "interp_latitude", "interp_longitude", "azimuth_deg",
+    "elevation_deg", "skyline_deg", "clearance_deg", "blocked",
+    "ground_z_m", "camera_z_m", "buildings_near"].join(",")];
+  let i = 0;
+  const chunk = () => {
+    const end = Math.min(T.length, i + 1500);
+    for (; i < end; i++) {
+      const pos = state.track[i], az = S.kymeta_az[i], el = S.kymeta_el[i];
+      if (!pos || az == null || el == null) continue;
+      const scene = localScene(pos[0], pos[1], antennaH);
+      const sky = skylineAt(scene, az);
+      const c = el - sky.el;
+      clear[i] = +c.toFixed(3);
+      rows.push([T[i], pos[0].toFixed(7), pos[1].toFixed(7), az.toFixed(3),
+        el.toFixed(3), sky.el.toFixed(3), c.toFixed(3), c < 0 ? 1 : 0,
+        scene.ground.toFixed(2), scene.camZ.toFixed(2), scene.near.length].join(","));
+    }
+    if (i < T.length) {
+      setStatus(`遮蔽を計算中… ${Math.round(i / T.length * 100)}%`);
+      setTimeout(chunk, 0);
+      return;
+    }
+    S.clearance_deg = clear;
+    const v = clear.filter(x => x != null);
+    state.run.stats = state.run.stats || {};
+    if (v.length) state.run.stats.clearance_deg = {
+      mean: v.reduce((a, b) => a + b, 0) / v.length,
+      min: Math.min(...v), max: Math.max(...v), n: v.length, phase: null };
+    state.clearCSV = rows.join("\n") + "\n";
+    state.clearAt = antennaH;
+    $("#statsInfo").textContent = statsLine(state.run);
+    const blocked = v.filter(x => x < 0).length;
+    setStatus(`遮蔽の計算が完了しました: ${v.length} 秒中 ${blocked} 秒`
+      + `(${(blocked / Math.max(1, v.length) * 100).toFixed(1)}%)が建物で遮蔽`
+      + `(アンテナ地上高 ${antennaH}m)`);
+    render();
+    if (done) done();
+  };
+  setStatus("遮蔽を計算中… 0%");
+  setTimeout(chunk, 0);
+}
+
+$("#bldPick").onclick = () => $("#bldInput").click();
+$("#bldInput").onchange = e => loadCityGML(e.target.files);
+$("#saveBld").onclick = () => {
+  if (!state.bld.list.length) return;
+  download("buildings.json", JSON.stringify({ count: state.bld.list.length,
+    meta: state.bld.meta, buildings: state.bld.list }), "application/json");
+};
+const clearanceFresh = () =>
+  state.clearCSV && state.clearAt === (+$("#povH").value || 2.6);
+$("#calcClear").onclick = () => {
+  if (state.bld.prepared) computeClearanceAll();
+};
+$("#saveClear").onclick = () => {
+  if (!state.bld.prepared) return;
+  const save = () => download("kymeta_clearance.csv", "﻿" + state.clearCSV,
+                              "text/csv;charset=utf-8");
+  clearanceFresh() ? save() : computeClearanceAll(save);
+};
 
 async function loadBuildings(path) {
   try {
