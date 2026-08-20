@@ -63,7 +63,7 @@ dialog::backdrop{background:rgba(0,0,0,.45)}
 <header>
   <h1>LEO データビューア</h1>
   <button id="pick" class="primary">データを選択…</button>
-  <input id="fileInput" type="file" multiple accept=".csv,.gz,.jsonl" hidden>
+  <input id="fileInput" type="file" multiple accept=".csv,.gz,.jsonl,.json" hidden>
   <input id="dirInput" type="file" webkitdirectory directory hidden>
   <span id="srcName" class="muted">未選択</span>
   <span style="flex:1"></span>
@@ -100,6 +100,7 @@ dialog::backdrop{background:rgba(0,0,0,.45)}
       <span><span class="sw" style="background:var(--s2)"></span>上り Mbps</span>
       <span><span class="sw" style="background:var(--s3)"></span>RTT ms</span>
       <span><span class="sw" style="background:var(--s4)"></span>SINR dB</span>
+      <span><span class="sw" style="background:var(--ink-2)"></span>クリアランス°(PLATEAU)</span>
       <span class="muted">縦線=再生位置。クリックでその時刻へ移動。
         横の破線=その系列の平均</span>
     </div>
@@ -165,6 +166,46 @@ dialog::backdrop{background:rgba(0,0,0,.45)}
         方角の対応は公式仕様が非公開のため北を上と仮定しています
         (アプリの表示と見比べ、ずれていれば回転で合わせてください)</span>
     </div>
+  </section>
+
+  <section class="card" id="povCard" style="display:none">
+    <h2>アンテナ視点(PLATEAU 3D都市モデル)</h2>
+    <canvas id="pov" height="440"></canvas>
+    <div class="legend">
+      <span><span class="sw" style="background:var(--crit)"></span>ビーム中心(追尾方向)</span>
+      <span><span class="sw" style="background:rgba(208,59,59,.35)"></span>半値角</span>
+      <span><span class="sw" style="background:#8b8b84"></span>建物(PLATEAU)</span>
+      <span><span class="sw" style="background:#9fc3e8"></span>空(見通しあり)</span>
+    </div>
+    <div class="row" style="margin-top:6px">
+      <label class="muted">視野角
+        <select id="povFov">
+          <option value="30">30°</option><option value="60" selected>60°</option>
+          <option value="90">90°</option><option value="120">120°</option>
+        </select>
+      </label>
+      <label class="muted">アンテナ地上高
+        <input id="povH" type="number" value="2.6" step="0.1" min="0" max="30"
+               style="width:70px"> m
+      </label>
+      <label class="muted">半値角
+        <input id="povHpbw" type="number" value="2.6" step="0.1" min="0.1" max="30"
+               style="width:64px"> °
+      </label>
+      <label class="muted"><input type="checkbox" id="povLabels" checked> 建物の高さ</label>
+    </div>
+    <div class="muted" id="povInfo" style="margin-top:6px"></div>
+  </section>
+
+  <section class="card" id="skylineCard" style="display:none">
+    <h2>スカイライン断面(全方位の見通し仰角)</h2>
+    <canvas id="skyline" height="300"></canvas>
+    <div class="legend">
+      <span><span class="sw" style="background:#8b8b84"></span>建物で塞がれている範囲</span>
+      <span><span class="sw" style="background:var(--crit)"></span>現在のビーム方向</span>
+      <span><span class="sw" style="background:var(--s2)"></span>直近60秒の指向軌跡</span>
+    </div>
+    <div class="muted" id="skylineInfo" style="margin-top:6px"></div>
   </section>
 
   <section class="card">
@@ -250,6 +291,8 @@ const state = {
   // 障害物マップ(Starlink)と、15秒ハンドオーバー境界の集計
   obs: { list: [], grids: new Map(), shown: -1, path: null, pending: false },
   handover: null,
+  bld: { list: [], meta: {}, prepared: null },   // PLATEAUの建物
+  track: null,                                    // 1秒ごとに内挿した位置
 };
 
 // StarlinkはUTCの15秒グリッド(:00/:15/:30/:45)でスケジューリングしており、
@@ -319,7 +362,13 @@ function applyRun(run) {
     run.series.starlink_az && run.series.starlink_az.some(v => v != null)
       ? "" : "none";
   updateObsCard();
-  if (SERVER_MODE && run.path) loadObstructionIndex(run.path);
+  state.track = buildTrack(run);
+  applyBuildings(run.bldLocal ? { buildings: run.bldLocal.buildings,
+                                  meta: run.bldLocal.meta } : null);
+  if (SERVER_MODE && run.path) {
+    loadObstructionIndex(run.path);
+    loadBuildings(run.path);
+  }
   const src = run.sources.map(s => s.file).join(", ");
   setStatus("読み込み完了: " + src +
     (run.meta && run.meta.tool_version ? " / " + run.meta.tool_version : ""));
@@ -329,7 +378,8 @@ function applyRun(run) {
 // スループットは自分のフェーズの中でしか意味を持たない。下りの平均を
 // アイドル区間や上り区間まで含めて取ると本来の値が埋もれる
 const STAT_PHASE = { down_mbps: "download", up_mbps: "upload" };
-const STAT_KEYS = ["down_mbps", "up_mbps", "rtt_ms", "snr_db", "loss", "speed"];
+const STAT_KEYS = ["down_mbps", "up_mbps", "rtt_ms", "snr_db", "loss", "speed",
+                   "clearance_deg"];
 
 // 平均・最大・最小。必ず間引く前の全サンプルを渡すこと
 function seriesStats(rows) {
@@ -408,10 +458,12 @@ const RX = {
   loss: [/pop_ping_drop_rate$/i],
   snr_db: [/sinr[_ ]?db$/i, /\bsinr$/i, /snr_db$/i],
   speed: [/position\.speed$/i],
+  clearance_deg: [/^clearance_deg$/i],
   kymeta_az: [/look-angle\.azimuth$/i], kymeta_el: [/look-angle\.elevation$/i],
   starlink_az: [/boresight_azimuth_deg$/i], starlink_el: [/boresight_elevation_deg$/i],
-  lat: [/position\.latitude$/i, /location\.latitude$/i, /\blatitude$/i],
-  lon: [/position\.longitude$/i, /location\.longitude$/i, /\blongitude$/i],
+  // interp_* は本ツールが内挿した位置なので実測の緯度経度とは分ける
+  lat: [/position\.latitude$/i, /location\.latitude$/i, /(?<!interp_)\blatitude$/i],
+  lon: [/position\.longitude$/i, /location\.longitude$/i, /(?<!interp_)\blongitude$/i],
 };
 // 指向データの性質。同じ「方位/仰角」でも意味がまったく違うので区別して描く。
 //   look  … 追尾中の衛星の方向(Look Angle)。ハンドオーバーで跳ぶ
@@ -442,9 +494,15 @@ async function parseObstruction(file) {
 
 async function loadFiles(all) {
   const obsFiles = Array.from(all).filter(f => /obstruction.*\.jsonl(\.gz)?$/i.test(f.name));
+  const bldFile = Array.from(all).find(f => /^buildings\.json$/i.test(f.name));
   const files = Array.from(all).filter(f => /\.csv(\.gz)?$/i.test(f.name));
   if (!files.length) { setStatus("CSVが見つかりませんでした"); return; }
   setStatus("読み込み中… (" + files.length + " ファイル)");
+  let bldLocal = null;
+  if (bldFile) {
+    try { bldLocal = JSON.parse(await readTextFile(bldFile)); }
+    catch (e) { setStatus("buildings.json を読めませんでした: " + e.message); }
+  }
   let obsLocal = null;
   for (const f of obsFiles) {
     try { obsLocal = (obsLocal || []).concat(await parseObstruction(f)); }
@@ -508,7 +566,7 @@ async function loadFiles(all) {
   if (obsLocal) obsLocal.sort((a, b) => a.epoch - b.epoch);
   applyRun({ label: files[0].webkitRelativePath?.split("/")[0] || files[0].name,
              path: null, meta: {}, sources: used.map(f => ({ file: f })),
-             times, series, home, step, obsLocal, handover, stats });
+             times, series, home, step, obsLocal, handover, stats, bldLocal });
   state.lastFiles = all;
 }
 
@@ -605,8 +663,330 @@ function render(initial) {
   drawSky();
   drawMap();
   drawObstruction();
+  drawPOV();
+  drawSkyline();
   maybeFetchSats(t);
   maybeFetchRain(t);
+}
+
+// ---------- PLATEAU: アンテナ視点と見通し ----------
+const M_LAT = 111320, LOS_RADIUS_M = 400;
+const mPerLon = lat => M_LAT * Math.cos(lat * Math.PI / 180);
+
+// Kymetaの位置は2秒更新なので、時速46km/hでは1更新で最大26m進む。
+// Pythonの --plateau と同じ規則で1秒ごとに内挿する
+function buildTrack(run) {
+  const t = run.times, la = run.series.lat || [], lo = run.series.lon || [];
+  const knots = [];
+  t.forEach((tt, i) => {
+    if (la[i] == null || lo[i] == null) return;
+    const k = knots[knots.length - 1];
+    if (!k || k[1] !== la[i] || k[2] !== lo[i]) knots.push([tt, la[i], lo[i]]);
+  });
+  if (knots.length < 2) return t.map((_, i) =>
+    la[i] != null && lo[i] != null ? [la[i], lo[i]] : null);
+  let k = 0;
+  return t.map(tt => {
+    if (tt < knots[0][0] || tt > knots[knots.length - 1][0]) return null;
+    while (k + 2 < knots.length && knots[k + 1][0] <= tt) k++;
+    const [t0, a0, o0] = knots[k], [t1, a1, o1] = knots[k + 1];
+    if (t1 === t0) return [a0, o0];
+    const f = Math.max(0, Math.min(1, (tt - t0) / (t1 - t0)));
+    return [a0 + (a1 - a0) * f, o0 + (o1 - o0) * f];
+  });
+}
+
+function prepareBuildings(list) {
+  return list.map(b => {
+    let la = 0, lo = 0;
+    b.poly.forEach(p => { la += p[0]; lo += p[1]; });
+    la /= b.poly.length; lo /= b.poly.length;
+    const ml = mPerLon(la);
+    let r = 0;
+    b.poly.forEach(p => {
+      r = Math.max(r, Math.hypot((p[1] - lo) * ml, (p[0] - la) * M_LAT));
+    });
+    return { poly: b.poly, z0: b.z0, h: b.h, cla: la, clo: lo, r };
+  });
+}
+
+// カメラ位置まわりの建物を、ローカルなメートル座標に落とす
+function localScene(lat, lon, antennaH) {
+  const prepared = state.bld.prepared || [];
+  const ml = mPerLon(lat), near = [], grounds = [];
+  for (const b of prepared) {
+    const d = Math.hypot((b.clo - lon) * ml, (b.cla - lat) * M_LAT);
+    if (d - b.r > LOS_RADIUS_M) continue;
+    near.push({ z0: b.z0, h: b.h, d,
+      pts: b.poly.map(p => [(p[1] - lon) * ml, (p[0] - lat) * M_LAT]) });
+    grounds.push(b.z0);
+  }
+  grounds.sort((a, b) => a - b);
+  // 地面の高さは建物側から取る。アンテナ地上高の指定がそのまま効くように
+  const ground = grounds.length ? grounds[grounds.length >> 1] : 0;
+  return { near, ground, camZ: ground + antennaH };
+}
+
+function rayDistance(dx, dy, pts) {
+  let best = null;
+  for (let i = 0; i < pts.length; i++) {
+    const [x1, y1] = pts[i], [x2, y2] = pts[(i + 1) % pts.length];
+    const ex = x2 - x1, ey = y2 - y1;
+    const den = dx * ey - dy * ex;
+    if (Math.abs(den) < 1e-12) continue;
+    const t = (x1 * ey - y1 * ex) / den, s = (x1 * dy - y1 * dx) / den;
+    if (t > 0 && s >= 0 && s <= 1 && (best === null || t < best)) best = t;
+  }
+  return best;
+}
+
+// Python側の Skyline.elevation_at と同じ計算(表示値がCSVと一致するように)
+function skylineAt(scene, azimuth) {
+  const a = azimuth * Math.PI / 180, dx = Math.sin(a), dy = Math.cos(a);
+  let best = 0, cause = null;
+  for (const b of scene.near) {
+    const top = b.z0 + b.h - scene.camZ;
+    if (top <= 0) continue;
+    const d = rayDistance(dx, dy, b.pts);
+    if (d === null || d <= 0.5) continue;
+    const el = Math.atan2(top, d) * 180 / Math.PI;
+    if (el > best) { best = el; cause = b; }
+  }
+  return { el: best, cause };
+}
+
+function camBasis(az, el) {
+  const a = az * Math.PI / 180, e = el * Math.PI / 180;
+  const f = [Math.cos(e) * Math.sin(a), Math.cos(e) * Math.cos(a), Math.sin(e)];
+  const r = [Math.cos(a), -Math.sin(a), 0];
+  const u = [r[1] * f[2] - r[2] * f[1], r[2] * f[0] - r[0] * f[2],
+             r[0] * f[1] - r[1] * f[0]];
+  return { f, r, u };
+}
+
+// 近接面(カメラの前だけ)で多角形を切る。建物はカメラの真横にも来る
+function clipNear(poly, eps) {
+  const out = [];
+  for (let i = 0; i < poly.length; i++) {
+    const a = poly[i], b = poly[(i + 1) % poly.length];
+    const ain = a[2] > eps, bin = b[2] > eps;
+    if (ain) out.push(a);
+    if (ain !== bin) {
+      const t = (eps - a[2]) / (b[2] - a[2]);
+      out.push([a[0] + (b[0] - a[0]) * t, a[1] + (b[1] - a[1]) * t, eps]);
+    }
+  }
+  return out;
+}
+
+function povState() {
+  if (!state.bld.prepared || !state.track) return null;
+  const pos = state.track[state.idx];
+  const az = cur("kymeta_az"), el = cur("kymeta_el");
+  if (!pos || az == null || el == null) return null;
+  const antennaH = +$("#povH").value || 2.6;
+  const scene = localScene(pos[0], pos[1], antennaH);
+  const sky = skylineAt(scene, az);
+  return { pos, az, el, scene, sky, clearance: el - sky.el, antennaH };
+}
+
+function drawPOV() {
+  if ($("#povCard").style.display === "none") return;
+  const s = povState();
+  const [g, W, H] = fitCanvas($("#pov"), 440);
+  if (!s) {
+    g.fillStyle = css("--muted"); g.font = "13px system-ui";
+    g.fillText("この時刻には位置または指向のデータがありません", 12, 24);
+    $("#povInfo").textContent = "";
+    return;
+  }
+  const FOV = +$("#povFov").value, HPBW = +$("#povHpbw").value || 2.6;
+  const fpx = (W / 2) / Math.tan(FOV / 2 * Math.PI / 180);
+  const cx = W / 2, cy = H / 2;
+  const { f, r, u } = camBasis(s.az, s.el);
+  const dot = (p, q) => p[0] * q[0] + p[1] * q[1] + p[2] * q[2];
+  const toCam = p => [dot(p, r), dot(p, u), dot(p, f)];
+  const scr = c => [cx + fpx * c[0] / c[2], cy - fpx * c[1] / c[2]];
+  const dir = (az, el) => {
+    const a = az * Math.PI / 180, e = el * Math.PI / 180;
+    return [Math.cos(e) * Math.sin(a), Math.cos(e) * Math.cos(a), Math.sin(e)];
+  };
+
+  const grad = g.createLinearGradient(0, 0, 0, H);
+  grad.addColorStop(0, "#7fb0de"); grad.addColorStop(1, "#cfe1f2");
+  g.fillStyle = grad; g.fillRect(0, 0, W, H);
+
+  // 天球グリッド(等仰角線と子午線)を球面のまま描く
+  const arc = pts => {
+    g.beginPath(); let pen = false;
+    for (const p of pts) {
+      const c = toCam(p);
+      if (c[2] <= .05) { pen = false; continue; }
+      const q = scr(c);
+      pen ? g.lineTo(q[0], q[1]) : g.moveTo(q[0], q[1]); pen = true;
+    }
+    g.stroke();
+  };
+  g.strokeStyle = "rgba(255,255,255,.45)"; g.lineWidth = 1;
+  for (let el = 0; el <= 80; el += 10) {
+    const pts = []; for (let az = 0; az <= 360; az += 3) pts.push(dir(az, el));
+    arc(pts);
+  }
+  for (let az = 0; az < 360; az += 15) {
+    const pts = []; for (let el = 0; el <= 89; el += 3) pts.push(dir(az, el));
+    arc(pts);
+  }
+  g.fillStyle = "rgba(255,255,255,.95)"; g.font = "11px system-ui";
+  for (let el = 0; el <= 80; el += 10) {
+    const c = toCam(dir(s.az - FOV / 2 + 2, el));
+    if (c[2] <= .05) continue;
+    const q = scr(c);
+    if (q[0] > 0 && q[0] < W && q[1] > 12 && q[1] < H - 4) g.fillText(el + "°", q[0], q[1] - 3);
+  }
+  const NAME = {0:"N",45:"NE",90:"E",135:"SE",180:"S",225:"SW",270:"W",315:"NW"};
+  let lastX = -1e9;
+  for (let az = 0; az < 360; az += 15) {
+    const c = toCam(dir(az, Math.max(0, s.el - FOV / 2 + 3)));
+    if (c[2] <= .05) continue;
+    const q = scr(c);
+    if (q[0] < 6 || q[0] > W - 24 || q[1] < 0 || q[1] > H) continue;
+    if (Math.abs(q[0] - lastX) < 42) continue;
+    lastX = q[0];
+    g.fillText(NAME[az] || az + "°", q[0] - 6, q[1]);
+  }
+
+  // 建物(遠いものから描いて手前で上書き)
+  const sorted = s.scene.near.slice().sort((a, b) => b.d - a.d);
+  const showLabels = $("#povLabels").checked;
+  for (const b of sorted) {
+    const zt = b.z0 + b.h - s.scene.camZ, zb = b.z0 - s.scene.camZ;
+    const top = b.pts.map(p => toCam([p[0], p[1], zt]));
+    const bot = b.pts.map(p => toCam([p[0], p[1], zb]));
+    const faces = [];
+    for (let i = 0; i < b.pts.length; i++) {
+      const j = (i + 1) % b.pts.length;
+      faces.push({ poly: [top[i], top[j], bot[j], bot[i]], wall: true });
+    }
+    faces.push({ poly: top, wall: false });
+    for (const face of faces) {
+      const clipped = clipNear(face.poly, .3);
+      if (clipped.length < 3) continue;
+      g.beginPath();
+      clipped.forEach((c, i) => {
+        const q = scr(c);
+        i ? g.lineTo(q[0], q[1]) : g.moveTo(q[0], q[1]);
+      });
+      g.closePath();
+      g.fillStyle = face.wall ? "#8b8b84" : "#a9a9a2";
+      g.strokeStyle = "#63635d"; g.lineWidth = 1;
+      g.fill(); g.stroke();
+    }
+    if (showLabels) {
+      const vis = top.filter(c => c[2] > .3).map(scr);
+      if (vis.length) {
+        const p = vis.reduce((a, q) => q[1] < a[1] ? q : a);
+        if (p[0] > 0 && p[0] < W - 40 && p[1] > 12 && p[1] < H) {
+          g.fillStyle = "#fff"; g.font = "11px system-ui";
+          g.fillText(b.h.toFixed(0) + "m", p[0] + 4, p[1] - 4);
+        }
+      }
+    }
+  }
+
+  // ビーム中心と半値角
+  const R = fpx * Math.tan(HPBW / 2 * Math.PI / 180);
+  g.strokeStyle = css("--crit"); g.fillStyle = "rgba(208,59,59,.25)"; g.lineWidth = 2;
+  g.beginPath(); g.arc(cx, cy, Math.max(R, 2), 0, 7); g.fill(); g.stroke();
+  g.beginPath();
+  g.moveTo(cx - 18, cy); g.lineTo(cx - R - 3, cy); g.moveTo(cx + R + 3, cy); g.lineTo(cx + 18, cy);
+  g.moveTo(cx, cy - 18); g.lineTo(cx, cy - R - 3); g.moveTo(cx, cy + R + 3); g.lineTo(cx, cy + 18);
+  g.stroke();
+  g.fillStyle = css("--crit"); g.font = "11px system-ui";
+  g.fillText(`${s.az.toFixed(1)}° / ${s.el.toFixed(1)}°`, cx + R + 10, cy - 6);
+  g.fillText(`半値角 ±${(HPBW / 2).toFixed(1)}°`, cx + R + 10, cy + 8);
+
+  // 判定チップ
+  const blocked = s.clearance < 0;
+  g.fillStyle = blocked ? "rgba(208,59,59,.95)" : "rgba(27,175,122,.95)";
+  g.beginPath(); g.roundRect(10, H - 52, 372, 42, 8); g.fill();
+  g.fillStyle = "#fff"; g.font = "bold 14px system-ui";
+  g.fillText(blocked
+    ? `遮蔽  ${s.sky.cause ? s.sky.cause.h.toFixed(0) + "m の建物" : "建物"}が視線上にあります`
+    : "見通しあり", 22, H - 33);
+  g.font = "11px system-ui";
+  g.fillText(`クリアランス ${s.clearance >= 0 ? "+" : ""}${s.clearance.toFixed(1)}°`
+    + `(スカイライン ${s.sky.el.toFixed(1)}° / ビーム ${s.el.toFixed(1)}°)`, 22, H - 17);
+
+  $("#povInfo").textContent =
+    `建物 ${s.scene.near.length} 棟が半径${LOS_RADIUS_M}m以内 / 地盤 ${s.scene.ground.toFixed(1)}m`
+    + ` + アンテナ地上高 ${s.antennaH}m = 視点高 ${s.scene.camZ.toFixed(1)}m。`
+    + "PLATEAUに含まれない樹木・電柱・架線・車両は描かれません。"
+    + "位置は2秒更新のため1秒ごとに内挿しています";
+}
+
+function drawSkyline() {
+  if ($("#skylineCard").style.display === "none") return;
+  const [g, W, H] = fitCanvas($("#skyline"), 300);
+  const s = povState();
+  if (!s) return;
+  const pad = { l: 34, r: 10, t: 10, b: 22 };
+  const pw = W - pad.l - pad.r, ph = H - pad.t - pad.b;
+  const X = az => pad.l + pw * az / 360, Y = el => pad.t + ph * (1 - el / 90);
+  g.fillStyle = "#eef4fa"; g.fillRect(pad.l, pad.t, pw, ph);
+  const prof = [];
+  for (let az = 0; az <= 360; az += 1) prof.push(skylineAt(s.scene, az).el);
+  g.fillStyle = "#8b8b84"; g.beginPath(); g.moveTo(X(0), Y(0));
+  prof.forEach((el, az) => g.lineTo(X(az), Y(el)));
+  g.lineTo(X(360), Y(0)); g.closePath(); g.fill();
+  g.strokeStyle = "rgba(0,0,0,.08)"; g.fillStyle = css("--muted"); g.font = "11px system-ui";
+  for (let el = 0; el <= 90; el += 15) {
+    g.beginPath(); g.moveTo(pad.l, Y(el)); g.lineTo(W - pad.r, Y(el)); g.stroke();
+    g.fillText(el + "°", 4, Y(el) + 4);
+  }
+  ["N","NE","E","SE","S","SW","W","NW","N"].forEach((n, i) =>
+    g.fillText(n, X(i * 45) - 6, H - 6));
+  // 直近60秒の指向軌跡
+  const S = state.run.series;
+  g.strokeStyle = css("--s2"); g.lineWidth = 2; g.beginPath();
+  let pen = false;
+  for (let i = Math.max(0, state.idx - 60); i <= state.idx; i++) {
+    const a = S.kymeta_az[i], e = S.kymeta_el[i];
+    if (a == null || e == null) { pen = false; continue; }
+    pen ? g.lineTo(X((a % 360 + 360) % 360), Y(e)) : g.moveTo(X((a % 360 + 360) % 360), Y(e));
+    pen = true;
+  }
+  g.stroke();
+  g.strokeStyle = css("--crit"); g.lineWidth = 2.5;
+  g.beginPath(); g.arc(X((s.az % 360 + 360) % 360), Y(s.el), 7, 0, 7); g.stroke();
+  // 可視率
+  const vis = k => prof.filter(el => el < k).length / prof.length * 100;
+  $("#skylineInfo").textContent =
+    `この地点の可視率: 仰角25°以上で ${vis(25).toFixed(1)}% / 40°以上で ${vis(40).toFixed(1)}%`
+    + " — 灰色の上端が建物のスカイライン。ビーム(赤)がその中に入ると遮蔽と判定します";
+}
+
+["#povFov", "#povH", "#povHpbw", "#povLabels"].forEach(sel => {
+  $(sel).onchange = () => { drawPOV(); drawSkyline(); drawTiles(); };
+});
+
+async function loadBuildings(path) {
+  try {
+    const j = await api("/api/buildings", { path });
+    applyBuildings(j);
+  } catch (e) { applyBuildings({ buildings: [], meta: {} }); }
+}
+
+function applyBuildings(payload) {
+  const list = (payload && payload.buildings) || [];
+  state.bld = { list, meta: (payload && payload.meta) || {},
+                prepared: list.length ? prepareBuildings(list) : null };
+  const on = list.length && state.run &&
+    (state.run.series.kymeta_az || []).some(v => v != null);
+  $("#povCard").style.display = on ? "" : "none";
+  $("#skylineCard").style.display = on ? "" : "none";
+  if (on && state.bld.meta.antenna_height_m)
+    $("#povH").value = state.bld.meta.antenna_height_m;
+  if (state.run) render();
 }
 
 // ---------- Starlink obstruction map ----------
@@ -724,13 +1104,15 @@ const STAT_LABEL = { down_mbps: ["下り", "Mbps"], up_mbps: ["上り", "Mbps"],
                      rtt_ms: ["RTT", "ms"], snr_db: ["SINR", "dB"],
                      // ロス率は0の秒が記録されないので、平均は「損失が
                      // 出た秒だけ」の平均になる。誤読しないよう明示する
-                     loss: ["ロス率(発生秒のみ)", ""], speed: ["速度", "m/s"] };
+                     loss: ["ロス率(発生秒のみ)", ""], speed: ["速度", "m/s"],
+                     clearance_deg: ["クリアランス", "°"] };
 const fmtVal = (v, unit) => (+v).toFixed(unit === "Mbps" ? 1 : unit === "" ? 3 : 2);
 
 function drawTiles() {
   const stats = state.run.stats || {};
   // 現在値と、その系列の全区間平均を並べる。平均は間引きの影響を受けない
-  const tiles = ["down_mbps", "up_mbps", "rtt_ms", "snr_db", "speed"]
+  const tiles = ["down_mbps", "up_mbps", "rtt_ms", "snr_db", "speed",
+                 "clearance_deg"]
     .map(key => {
       const now = cur(key), st = stats[key];
       if (now == null && !st) return "";
@@ -776,7 +1158,8 @@ function drawStrip() {
   const pad = { l: 40, r: 8, t: 8, b: 16 };
   const plot = { w: w - pad.l - pad.r, h: h - pad.t - pad.b };
   const chans = [["down_mbps", "--s1"], ["up_mbps", "--s2"],
-                 ["rtt_ms", "--s3"], ["snr_db", "--s4"]];
+                 ["rtt_ms", "--s3"], ["snr_db", "--s4"],
+                 ["clearance_deg", "--ink-2"]];
   const xOf = i => pad.l + plot.w * (i / Math.max(1, n - 1));
   drawHandoverMarks(g, pad, plot, n, xOf);
   g.strokeStyle = css("--grid"); g.beginPath();
@@ -785,10 +1168,14 @@ function drawStrip() {
   chans.forEach(([key, col], ci) => {
     const s = state.run.series[key]; if (!s || !s.some(v => v != null)) return;
     const vals = s.filter(v => v != null);
-    const max = Math.max(...vals) || 1;
+    // SINRもクリアランスも負になる。0からの比で描くと枠外にはみ出すので
+    // 実際の下限〜上限でスケールする
+    const lo = Math.min(0, ...vals), hi = Math.max(...vals);
+    const span = (hi - lo) || 1;
+    const yOf = v => pad.t + plot.h * (1 - (v - lo) / span);
     const st = stats[key];
-    if (st && st.mean <= max) {   // 平均を同じスケールの水平破線で重ねる
-      const y = pad.t + plot.h * (1 - st.mean / max);
+    if (st) {   // 平均を同じスケールの水平破線で重ねる
+      const y = yOf(st.mean);
       g.strokeStyle = css(col); g.lineWidth = 1;
       g.setLineDash([5, 4]); g.globalAlpha = .55;
       g.beginPath(); g.moveTo(pad.l, y); g.lineTo(w - pad.r, y); g.stroke();
@@ -803,7 +1190,7 @@ function drawStrip() {
     s.forEach((v, i) => {
       if (v == null) { pen = false; return; }
       const x = pad.l + plot.w * (i / Math.max(1, n - 1));
-      const y = pad.t + plot.h * (1 - v / max);
+      const y = yOf(v);
       pen ? g.lineTo(x, y) : g.moveTo(x, y); pen = true;
     });
     g.stroke();

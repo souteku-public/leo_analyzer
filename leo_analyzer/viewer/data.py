@@ -18,6 +18,7 @@ CHANNELS = [
     ("loss", [r"pop_ping_drop_rate$"], 1.0),
     ("snr_db", [r"sinr[_ ]?db$", r"\bsinr$", r"snr_db$"], 1.0),
     ("speed", [r"position\.speed$"], 1.0),
+    ("clearance_deg", [r"^clearance_deg$"], 1.0),
 ]
 # antenna pointing: (source, azimuth patterns, elevation patterns).
 # Kymeta's look-angle is the direction of the satellite being tracked and
@@ -28,8 +29,10 @@ POINTING = [
     ("kymeta", [r"look-angle\.azimuth$"], [r"look-angle\.elevation$"]),
     ("starlink", [r"boresight_azimuth_deg$"], [r"boresight_elevation_deg$"]),
 ]
-LAT_PATTERNS = [r"position\.latitude$", r"\blatitude$", r"\blat$"]
-LON_PATTERNS = [r"position\.longitude$", r"\blongitude$", r"\blon$"]
+# interp_* is excluded: it is this tool's own interpolation of the antenna
+# position, written next to the clearance figures, not a measured fix
+LAT_PATTERNS = [r"position\.latitude$", r"(?<!interp_)\blatitude$", r"\blat$"]
+LON_PATTERNS = [r"position\.longitude$", r"(?<!interp_)\blongitude$", r"\blon$"]
 OBSTRUCTION_NAMES = (
     "starlink_obstruction_map.jsonl.gz",
     "starlink_obstruction_map.jsonl",
@@ -119,7 +122,8 @@ HANDOVER_WINDOW_S = 2
 
 # Throughput only means something inside its own phase: averaging the
 # download rate across the idle baseline and the upload run buries it.
-STAT_KEYS = ["down_mbps", "up_mbps", "rtt_ms", "snr_db", "loss", "speed"]
+STAT_KEYS = ["down_mbps", "up_mbps", "rtt_ms", "snr_db", "loss", "speed",
+             "clearance_deg"]
 STAT_PHASE = {"down_mbps": "download", "up_mbps": "upload"}
 
 
@@ -185,6 +189,16 @@ def _handover_stats(samples: dict):
         "boundaries": boundaries,
         "occupied": occupied,
     }
+
+
+def buildings_for(target: str):
+    """The run's PLATEAU extract, if --plateau has been run for it."""
+    path = Path(target).expanduser()
+    base = path if path.is_dir() else path.parent
+    file = base / "buildings.json"
+    if not file.exists():
+        return {"count": 0, "meta": {}, "buildings": []}
+    return json.loads(file.read_text(encoding="utf-8"))
 
 
 def _obstruction_file(target: str):
@@ -336,8 +350,8 @@ def load_run(target: str, step: int = 1):
         times = kept
 
     keys = ["down_mbps", "up_mbps", "rtt_ms", "loss", "snr_db", "speed",
-            "kymeta_az", "kymeta_el", "starlink_az", "starlink_el",
-            "lat", "lon"]
+            "clearance_deg", "kymeta_az", "kymeta_el",
+            "starlink_az", "starlink_el", "lat", "lon"]
     series = {k: [samples[t].get(k) for t in times] for k in keys}
     series["phase"] = [samples[t].get("phase", "") for t in times]
 

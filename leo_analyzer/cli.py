@@ -139,6 +139,21 @@ def build_parser():
         "summary (default: 60, 0 disables)",
     )
     p.add_argument(
+        "--plateau",
+        nargs=2,
+        metavar=("CITYGML", "RUNDIR"),
+        help="build RUNDIR/buildings.json (and kymeta_clearance.csv) from a "
+        "PLATEAU CityGML file or folder, for the viewer's antenna-eye view",
+    )
+    p.add_argument(
+        "--antenna-height",
+        type=float,
+        default=2.6,
+        metavar="M",
+        help="antenna height above local ground, metres (default: 2.6); "
+        "adjustable afterwards in the viewer",
+    )
+    p.add_argument(
         "--kymeta-config",
         help="YAML config for the Kymeta collector "
         "(optional; defaults to https://192.168.44.2 with the factory admin "
@@ -300,6 +315,89 @@ def make_kymeta_collector(args):
     return KymetaCollector(cfg)
 
 
+def build_plateau(args):
+    """--plateau: cut PLATEAU down to the run's area and score the sightlines."""
+    import csv as _csv
+
+    from . import buildings as bl
+    from .viewer.data import load_run
+
+    source, rundir = args.plateau
+    rundir = Path(rundir)
+    run = load_run(str(rundir))
+    times = run["times"]
+    lat_s, lon_s = run["series"]["lat"], run["series"]["lon"]
+    if not any(v is not None for v in lat_s):
+        sys.exit(
+            "error: この測定には位置情報(緯度経度)がありません。"
+            "アンテナ視点は車両位置が必要です"
+        )
+    track = bl.interpolate_track(times, lat_s, lon_s)
+    fixes = [p for p in track if p]
+    print(f"走行範囲: {len(fixes)} 点 "
+          f"(位置は2秒更新のため1秒ごとに内挿しています)")
+
+    bbox = bl.track_bbox(fixes)
+    print(f"CityGMLを読み込み中: {source}")
+    found, stats = bl.parse_citygml([source], bbox=bbox, progress=print)
+    print(f"  走査 {stats['scanned']} 棟 / 範囲内 {len(found)} 棟 "
+          f"(形状を取れなかったもの {stats['unusable']} 棟)")
+    if not found:
+        print(
+            "警告: 走行範囲に建物が1棟もありませんでした。"
+            "対象メッシュのCityGMLか、範囲が合っているか確認してください"
+        )
+
+    out = rundir / "buildings.json"
+    bl.write_buildings(out, found, meta={
+        "source": str(source),
+        "antenna_height_m": args.antenna_height,
+        "bbox": list(bbox),
+    })
+    print(f"建物データ: {out}  ({out.stat().st_size / 1e6:.2f} MB)")
+
+    az_s, el_s = run["series"]["kymeta_az"], run["series"]["kymeta_el"]
+    if not any(v is not None for v in az_s):
+        print("指向データ(look-angle)が無いため、遮蔽判定は省略します")
+        return
+
+    index = bl.SkylineIndex(found)
+    path = rundir / "kymeta_clearance.csv"
+    blocked = 0
+    written = 0
+    with open(path, "w", encoding="utf-8", newline="") as f:
+        w = _csv.writer(f)
+        # interp_* rather than latitude/longitude: the viewer merges every
+        # CSV in the folder by epoch, and a plain "latitude" column here
+        # would fight with the antenna's own position column
+        w.writerow(["epoch", "interp_latitude", "interp_longitude", "azimuth_deg",
+                    "elevation_deg", "skyline_deg", "clearance_deg",
+                    "blocked", "ground_z_m", "camera_z_m", "buildings_near"])
+        for i, t in enumerate(times):
+            pos, az, el = track[i], az_s[i], el_s[i]
+            if not pos or az is None or el is None:
+                continue
+            sky = index.at(pos[0], pos[1], args.antenna_height)
+            skyline, _cause = sky.elevation_at(az)
+            clear = el - skyline
+            if clear < 0:
+                blocked += 1
+            written += 1
+            w.writerow([t, round(pos[0], 7), round(pos[1], 7), round(az, 3),
+                        round(el, 3), round(skyline, 3), round(clear, 3),
+                        1 if clear < 0 else 0, round(sky.ground, 2),
+                        round(sky.cam_z, 2), len(sky)])
+    print(f"遮蔽判定: {path}")
+    print(f"  {written} 秒中 {blocked} 秒 ({blocked / max(1, written) * 100:.1f}%) "
+          f"が建物で遮蔽(アンテナ地上高 {args.antenna_height} m)")
+    if written and blocked == 0:
+        print(
+            "  建物による遮蔽は検出されませんでした。仰角が高い測定では"
+            "よくある結果で、SINR低下の原因は樹木・電柱・架線・車両など"
+            "PLATEAUに含まれない物体である可能性があります"
+        )
+
+
 def starlink_probe(args):
     print(f"Starlink ディッシュ診断: {args.starlink_addr}\n")
     try:
@@ -410,6 +508,10 @@ async def run(args):
             print(f"    {col}: {size / 1e6:.1f} MB")
         print(f"軽量CSV : {slim}  ({st['slim_bytes'] / 1e6:.1f} MB)")
         print(f"分離データ: {bulk}  ({st['bulk_bytes'] / 1e6:.1f} MB)")
+        return
+
+    if args.plateau:
+        build_plateau(args)
         return
 
     if args.viewer:

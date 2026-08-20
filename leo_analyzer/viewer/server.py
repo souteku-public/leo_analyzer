@@ -68,6 +68,8 @@ class Handler(BaseHTTPRequestHandler):
                 self._json(
                     data_mod.load_run(arg("path"), step=max(1, int(arg("step", "1"))))
                 )
+            elif route == "/api/buildings":
+                self._json(data_mod.buildings_for(arg("path")))
             elif route == "/api/obstruction_index":
                 self._json(data_mod.obstruction_index(arg("path")))
             elif route == "/api/obstruction":
