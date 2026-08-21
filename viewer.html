@@ -982,9 +982,12 @@ function drawSkyline() {
 // ---------- CityGML をブラウザだけで読む ----------
 // PLATEAUの1メッシュは数百MBになるので DOMParser は使えない。
 // <bldg:Building> ブロックだけをストリームから拾って走行範囲で捨てる
-const GML_OPEN = "<bldg:Building", GML_CLOSE = "</bldg:Building>";
+// 名前空間の接頭辞は決め打ちにしない。PLATEAUの新しい製品仕様は
+// CityGML 3.0 系に移行しており、URIも高さの持ち方も変わる
+const PREFIX_RX = /<([A-Za-z0-9]+):Building[\s>]/;
 const POSLIST_RX = /<[A-Za-z0-9]*:?posList([^>]*)>([\s\S]*?)<\//g;
-const HEIGHT_RX = /<[A-Za-z0-9]*:?measuredHeight[^>]*>([^<]+)</;
+// 2.0 は bldg:measuredHeight、3.0 は Height オブジェクト配下の value
+const HEIGHT_RX = /<[A-Za-z0-9]*:?(?:measuredHeight|value)[^>]*>\s*([-\d.]+)\s*</;
 
 function parseBuildingBlock(text) {
   const rings = [];
@@ -1045,9 +1048,16 @@ async function scanCityGML(file, bbox, out, onProgress) {
   }
   const reader = file.stream().pipeThrough(new TextDecoderStream("utf-8")).getReader();
   let buf = "", bytes = 0, scanned = 0, kept = 0, tick = 0;
+  let GML_OPEN = null, GML_CLOSE = null;
   for (;;) {
     const { done, value } = await reader.read();
     if (value) { buf += value; bytes += value.length; }
+    if (!GML_OPEN) {          // 最初に出てきた接頭辞を採用する
+      const m = PREFIX_RX.exec(buf);
+      if (m) { GML_OPEN = `<${m[1]}:Building`; GML_CLOSE = `</${m[1]}:Building>`; }
+      else if (done) break;
+      else { if (buf.length > 4e6) buf = buf.slice(-64); continue; }
+    }
     for (;;) {
       const i = buf.indexOf(GML_OPEN);
       if (i === -1) break;

@@ -16,12 +16,11 @@ import math
 import xml.etree.ElementTree as ET
 from pathlib import Path
 
-# CityGML 2.0, as published by PLATEAU
-NS = {
-    "gml": "http://www.opengis.net/gml",
-    "bldg": "http://www.opengis.net/citygml/building/2.0",
-}
-BUILDING_TAG = f"{{{NS['bldg']}}}Building"
+# Matched on local names only. PLATEAU's newer product specifications move
+# to CityGML 3.0 / GML 3.2, which changes every namespace URI but keeps the
+# element names, so pinning namespaces would break on the newest data.
+def _local(tag: str) -> str:
+    return tag.rsplit("}", 1)[-1]
 DEFAULT_MARGIN_M = 500.0     # how far beyond the track to keep buildings
 DEFAULT_RADIUS_M = 400.0     # how far to look when testing a line of sight
 DEFAULT_ANTENNA_H = 2.6      # metres above local ground
@@ -36,7 +35,9 @@ def m_per_deg_lon(lat: float) -> float:
 
 def _pos_lists(element):
     """Every gml:posList under an element, as (lat, lon, z) triples."""
-    for node in element.iter(f"{{{NS['gml']}}}posList"):
+    for node in element.iter():
+        if _local(node.tag) != "posList":
+            continue
         raw = (node.text or "").split()
         dim = int(node.get("srsDimension", "3"))
         if dim != 3 or len(raw) < 9:
@@ -59,13 +60,17 @@ def _building(element):
     z0 = sum(p[2] for p in ground) / len(ground)
     top = max(p[2] for r in rings for p in r)
 
+    # CityGML 2.0 has bldg:measuredHeight; 3.0 moves it under a Height
+    # object as con:value. Fall back to the geometry when neither is usable.
     height = None
-    node = element.find(f"{{{NS['bldg']}}}measuredHeight")
-    if node is not None and node.text:
-        try:
-            height = float(node.text)
-        except ValueError:
-            height = None
+    for node in element.iter():
+        if _local(node.tag) in ("measuredHeight", "value") and node.text:
+            try:
+                height = float(node.text)
+            except ValueError:
+                continue
+            if height > 0:
+                break
     if not height or height <= 0:
         height = top - z0
     if height <= 0:
@@ -105,7 +110,7 @@ def parse_citygml(sources, bbox=None, progress=None):
     for file in files:
         kept_here = 0
         for _event, element in ET.iterparse(file, events=("end",)):
-            if element.tag != BUILDING_TAG:
+            if _local(element.tag) != "Building":
                 continue
             seen += 1
             parsed = _building(element)
