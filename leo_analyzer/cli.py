@@ -342,6 +342,10 @@ def build_plateau(args):
     found, stats = bl.parse_citygml([source], bbox=bbox, progress=print)
     print(f"  走査 {stats['scanned']} 棟 / 範囲内 {len(found)} 棟 "
           f"(形状を取れなかったもの {stats['unusable']} 棟)")
+    if stats.get("broken"):
+        print(f"  警告: 読めなかったファイル {len(stats['broken'])} 件: "
+              f"{', '.join(stats['broken'][:5])}"
+              + (" ほか" if len(stats["broken"]) > 5 else ""))
     if not found:
         print(
             "警告: 走行範囲に建物が1棟もありませんでした。"

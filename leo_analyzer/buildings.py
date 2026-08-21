@@ -84,6 +84,32 @@ def _building(element):
     return poly, z0, height
 
 
+def mesh_bounds(code: str):
+    """Lat/lon box of a standard 3rd-order (1 km) grid square code.
+
+    PLATEAU names every CityGML file after the mesh it covers, so a file
+    whose mesh misses the track can be skipped without opening it.
+    """
+    if len(code) != 8 or not code.isdigit():
+        return None
+    p, u = int(code[0:2]), int(code[2:4])
+    q, v = int(code[4]), int(code[5])
+    r, w = int(code[6]), int(code[7])
+    lat = (p + q / 8 + r / 80) / 1.5
+    lon = 100 + u + v / 8 + w / 80
+    return lat, lon, lat + 1 / 120, lon + 1 / 80
+
+
+def mesh_of(name: str):
+    """The leading 8-digit mesh code of a PLATEAU file name, if any."""
+    head = Path(name).name.split("_", 1)[0]
+    return head if len(head) == 8 and head.isdigit() else None
+
+
+def _overlaps(a, b) -> bool:
+    return not (a[2] < b[0] or a[0] > b[2] or a[3] < b[1] or a[1] > b[3])
+
+
 def _bbox_of(poly):
     lats = [p[0] for p in poly]
     lons = [p[1] for p in poly]
@@ -106,29 +132,48 @@ def parse_citygml(sources, bbox=None, progress=None):
     if not files:
         raise FileNotFoundError("CityGML(.gml)ファイルが見つかりませんでした")
 
-    out, seen, skipped = [], 0, 0
+    if bbox:   # a whole ward is hundreds of files; most miss the track
+        keep = []
+        for f in files:
+            code = mesh_of(f.name)
+            box = mesh_bounds(code) if code else None
+            if box is None or _overlaps(box, bbox):
+                keep.append(f)
+        if progress and len(keep) < len(files):
+            progress(f"  {len(files)} ファイル中 {len(keep)} ファイルが走行範囲に該当"
+                     f"(残りはメッシュ番号で読み飛ばし)")
+        files = keep
+
+    out, seen, skipped, broken = [], 0, 0, []
     for file in files:
         kept_here = 0
-        for _event, element in ET.iterparse(file, events=("end",)):
-            if _local(element.tag) != "Building":
-                continue
-            seen += 1
-            parsed = _building(element)
-            element.clear()
-            if parsed is None:
-                skipped += 1
-                continue
-            poly, z0, height = parsed
-            if bbox:
-                b = _bbox_of(poly)
-                if (b[2] < bbox[0] or b[0] > bbox[2]
-                        or b[3] < bbox[1] or b[1] > bbox[3]):
+        try:
+            for _event, element in ET.iterparse(file, events=("end",)):
+                if _local(element.tag) != "Building":
                     continue
-            out.append({"poly": poly, "z0": round(z0, 2), "h": round(height, 2)})
-            kept_here += 1
+                seen += 1
+                parsed = _building(element)
+                element.clear()
+                if parsed is None:
+                    skipped += 1
+                    continue
+                poly, z0, height = parsed
+                if bbox:
+                    b = _bbox_of(poly)
+                    if (b[2] < bbox[0] or b[0] > bbox[2]
+                            or b[3] < bbox[1] or b[1] > bbox[3]):
+                        continue
+                out.append({"poly": poly, "z0": round(z0, 2), "h": round(height, 2)})
+                kept_here += 1
+        except ET.ParseError as e:
+            # a truncated or malformed file must not lose the other wards;
+            # whatever parsed before the break is still usable
+            broken.append(file.name)
+            if progress:
+                progress(f"  {file.name}: 壊れています({e})。この分は飛ばします")
         if progress:
             progress(f"  {file.name}: {kept_here} 棟を採用")
-    return out, {"scanned": seen, "unusable": skipped}
+    return out, {"scanned": seen, "unusable": skipped, "broken": broken}
 
 
 # --- line of sight ------------------------------------------------------

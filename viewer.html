@@ -1030,6 +1030,37 @@ function polyInBBox(poly, bb) {
   return !(la1 < bb[0] || la0 > bb[2] || lo1 < bb[1] || lo0 > bb[3]);
 }
 
+// PLATEAUのファイル名は先頭が3次メッシュ(1km)番号。走行範囲に掛からない
+// ファイルは開かずに捨てられる — 区まるごと選んでも数秒で済むように
+function meshBounds(code) {
+  if (!/^\d{8}$/.test(code)) return null;
+  const p = +code.slice(0, 2), u = +code.slice(2, 4);
+  const q = +code[4], v = +code[5], r = +code[6], w = +code[7];
+  const lat = (p + q / 8 + r / 80) / 1.5, lon = 100 + u + v / 8 + w / 80;
+  return [lat, lon, lat + 1 / 120, lon + 1 / 80];
+}
+const meshOf = name => {
+  const head = name.split("/").pop().split("_")[0];
+  return /^\d{8}$/.test(head) ? head : null;
+};
+const boxOverlaps = (a, b) =>
+  !(a[2] < b[0] || a[0] > b[2] || a[3] < b[1] || a[1] > b[3]);
+
+// 走行範囲が掛かる3次メッシュの一覧(エクスプローラで手選びする人向け)。
+// 3次メッシュの南西端は緯度が 1/120 度、経度が 1/80 度の整数倍にあるので、
+// 端数の行や列を取りこぼさないよう番号を直接数える(標本化だと漏れる)
+function neededMeshes(bbox) {
+  const out = [];
+  for (let n = Math.floor(bbox[0] * 120); n <= Math.floor(bbox[2] * 120); n++) {
+    const p = Math.floor(n / 80), q = Math.floor((n % 80) / 10), r = n % 10;
+    for (let m = Math.floor(bbox[1] * 80); m <= Math.floor(bbox[3] * 80); m++) {
+      const u = Math.floor(m / 80) - 100, rest = m % 80;
+      out.push(`${p}${u}${q}${Math.floor(rest / 10)}${r}${rest % 10}`);
+    }
+  }
+  return out.sort();
+}
+
 function trackBBox(fixes, marginM) {
   let la0 = 90, lo0 = 180, la1 = -90, lo1 = -180, sum = 0;
   for (const [la, lo] of fixes) {
@@ -1106,10 +1137,20 @@ async function loadCityGML(files) {
     return;
   }
   const bbox = trackBBox(fixes, 500);
+  // 名前のメッシュ番号で先に絞る。区まるごと渡されても開くのは数ファイル
+  const use = gml.filter(f => {
+    const box = meshBounds(meshOf(f.name) || "");
+    return !box || boxOverlaps(box, bbox);
+  });
+  if (!use.length) {
+    setStatus(`選んだ ${gml.length} ファイルはどれも走行範囲に掛かりません。`
+      + `必要なメッシュ: ${neededMeshes(bbox).join(", ")}`);
+    return;
+  }
   const out = [];
   let scanned = 0;
   try {
-    for (const f of gml) {
+    for (const f of use) {
       const r = await scanCityGML(f, bbox, out, setStatus);
       scanned += r.scanned;
     }
@@ -1120,10 +1161,12 @@ async function loadCityGML(files) {
   applyBuildings({ buildings: out, count: out.length,
     meta: { source: gml.map(f => f.name).join(", "),
             antenna_height_m: +$("#povH").value || 2.6, bbox } });
-  setStatus(`CityGML ${gml.length} ファイル: ${scanned} 棟を走査し、`
+  setStatus(`CityGML ${gml.length} ファイル中 ${use.length} ファイルを解析`
+    + `(残りはメッシュ番号で読み飛ばし): ${scanned} 棟を走査し、`
     + `走行範囲の ${out.length} 棟を採用しました`
-    + (out.length ? "(buildings.json に保存しておくと次回が速くなります)"
-                  : " — 範囲内に建物がありません。対象メッシュを確認してください"));
+    + (out.length ? "。buildings.json に保存しておくと次回が速くなります"
+                  : ` — 範囲内に建物がありません。必要なメッシュ: `
+                    + neededMeshes(bbox).join(", ")));
 }
 
 function download(name, text, type) {
@@ -1180,7 +1223,16 @@ function computeClearanceAll(done) {
   setTimeout(chunk, 0);
 }
 
-$("#bldPick").onclick = () => $("#bldInput").click();
+$("#bldPick").onclick = () => {
+  // 選ぶ前に、必要な3次メッシュを知らせておく(エクスプローラで絞れるように)
+  const fixes = (state.track || []).filter(Boolean);
+  if (fixes.length) {
+    const m = neededMeshes(trackBBox(fixes, 500));
+    setStatus(`udx/bldg の .gml を選んでください(全部まとめて選んでOK)。`
+      + `この測定に必要なメッシュ: ${m.join(", ")}`);
+  }
+  $("#bldInput").click();
+};
 $("#bldInput").onchange = e => loadCityGML(e.target.files);
 $("#saveBld").onclick = () => {
   if (!state.bld.list.length) return;
