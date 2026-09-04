@@ -67,6 +67,7 @@ dialog::backdrop{background:rgba(0,0,0,.45)}
   <input id="dirInput" type="file" webkitdirectory directory hidden>
   <button id="bldPick" title="PLATEAUのCityGML(.gml)か、変換済みのbuildings.json">建物(PLATEAU)…</button>
   <input id="bldInput" type="file" multiple accept=".gml,.json" hidden>
+  <button id="exportHtml" title="測定データと建物を埋め込んだHTMLを保存。次回はそれを開くだけで同じ画面が出ます">HTMLで書き出す</button>
   <span id="srcName" class="muted">未選択</span>
   <span style="flex:1"></span>
   <label class="muted">粒度
@@ -550,34 +551,54 @@ async function loadFiles(all) {
     [...samples.entries()].filter(([, s]) => s.loss != null || s.rtt_ms != null)
       .map(([t]) => t));
   const stats = seriesStats([...samples.values()]);
-  let times = [...samples.keys()].sort((a, b) => a - b);
+  const times = [...samples.keys()].sort((a, b) => a - b);
+  const series = {};
+  Object.keys(RX).forEach(k => series[k] = times.map(t => samples.get(t)[k] ?? null));
+  series.phase = times.map(t => samples.get(t).phase || "");
+  if (obsLocal) obsLocal.sort((a, b) => a.epoch - b.epoch);
+  // 1秒解像度のまま保持する。粒度を変えるたびにファイルを読み直さずに
+  // 済み、HTML書き出しでも元の解像度を保てる
+  state.full = {
+    label: files[0].webkitRelativePath?.split("/")[0] || files[0].name,
+    sources: used.map(f => ({ file: f })), times, series, handover, stats,
+    obsLocal, bldLocal,
+  };
+  state.lastFiles = all;
+  applyStep();
+}
+
+// 1秒解像度の state.full から、指定の粒度で表示用データを作る
+function applyStep() {
+  const full = state.full;
+  if (!full) return;
   const step = +$("#step").value;
+  let times = full.times;
   if (step > 1) {
     const kept = []; let next = times[0];
     for (const t of times) if (t >= next) { kept.push(t); next = t + step; }
     times = kept;
   }
-  const keys = Object.keys(RX);
+  const idx = new Map(full.times.map((t, i) => [t, i]));
   const series = {};
-  keys.forEach(k => series[k] = times.map(t => samples.get(t)[k] ?? null));
-  series.phase = times.map(t => samples.get(t).phase || "");
-  const pos = times.map(t => samples.get(t)).filter(s => s.lat != null);
+  for (const [k, arr] of Object.entries(full.series))
+    series[k] = times.map(t => arr[idx.get(t)]);
+  const pos = times.map((t, i) => [series.lat[i], series.lon[i]])
+                   .filter(p => p[0] != null && p[1] != null);
   let home = null;
   if (pos.length) {
-    const mid = pos.reduce((a, s) => a + s.lat, 0) / pos.length;
+    const mid = pos.reduce((a, p) => a + p[0], 0) / pos.length;
     // 度ではなくメートルで判定する。数百mのテストコースを走っても
     // 度しきい値だと「静止」に見えてしまう
-    const ns = (Math.max(...pos.map(s => s.lat)) - Math.min(...pos.map(s => s.lat))) * 111320;
-    const ew = (Math.max(...pos.map(s => s.lon)) - Math.min(...pos.map(s => s.lon)))
+    const ns = (Math.max(...pos.map(p => p[0])) - Math.min(...pos.map(p => p[0]))) * 111320;
+    const ew = (Math.max(...pos.map(p => p[1])) - Math.min(...pos.map(p => p[1])))
              * 111320 * Math.cos(mid * Math.PI / 180);
-    home = { lat: mid, lon: pos.reduce((a, s) => a + s.lon, 0) / pos.length,
+    home = { lat: mid, lon: pos.reduce((a, p) => a + p[1], 0) / pos.length,
              moving: Math.hypot(ns, ew) > 50 };
   }
-  if (obsLocal) obsLocal.sort((a, b) => a.epoch - b.epoch);
-  applyRun({ label: files[0].webkitRelativePath?.split("/")[0] || files[0].name,
-             path: null, meta: {}, sources: used.map(f => ({ file: f })),
-             times, series, home, step, obsLocal, handover, stats, bldLocal });
-  state.lastFiles = all;
+  applyRun({ label: full.label, path: null, meta: full.meta || {},
+             sources: full.sources || [], times, series, home, step,
+             obsLocal: full.obsLocal, handover: full.handover,
+             stats: full.stats, bldLocal: full.bldLocal });
 }
 
 // 走行範囲がちょうど収まるズーム(静止なら市街地スケール)
@@ -620,7 +641,8 @@ $("#closeBrowser").onclick = closeDlg;
 $("#goPath").onclick = () => browse($("#pathInput").value);
 $("#useThis").onclick = () => { const p = $("#pathInput").value; closeDlg(); loadRun(p); };
 $("#step").onchange = () => {
-  if (state.run && state.run.path) loadRun(state.run.path);
+  if (state.full) applyStep();                       // 読み直さず間引き直す
+  else if (state.run && state.run.path) loadRun(state.run.path);
   else if (state.lastFiles) loadFiles(state.lastFiles);
 };
 
@@ -2082,16 +2104,133 @@ async function maybeFetchRain(t) {
 }
 $("#rainSrc").onchange = () => { state.rainAt = null; render(); };
 
+// ---------- 自己完結HTMLの書き出し ----------
+// 測定データ・建物・障害物マップをこのページ自身に埋め込んで保存する。
+// 動画と違い、粒度も再生速度も後から変えられるのが利点
+const DATA_TAG = "leo-embedded-data";
+
+async function gzipB64(text) {
+  if (!("CompressionStream" in window)) return null;
+  const stream = new Blob([text]).stream()
+    .pipeThrough(new CompressionStream("gzip"));
+  const buf = new Uint8Array(await new Response(stream).arrayBuffer());
+  let bin = "";
+  for (let i = 0; i < buf.length; i += 0x8000)
+    bin += String.fromCharCode.apply(null, buf.subarray(i, i + 0x8000));
+  return btoa(bin);
+}
+
+async function ungzipB64(b64) {
+  const bin = atob(b64), u8 = new Uint8Array(bin.length);
+  for (let i = 0; i < bin.length; i++) u8[i] = bin.charCodeAt(i);
+  const stream = new Blob([u8]).stream()
+    .pipeThrough(new DecompressionStream("gzip"));
+  return await new Response(stream).text();
+}
+
+async function fullResolutionRun() {
+  if (state.full) return state.full;
+  // サーバー版は表示用に間引かれているので、書き出し時だけ1秒で取り直す
+  if (state.run && state.run.path) {
+    const r = await api("/api/load", { path: state.run.path, step: 1 });
+    return { label: r.label, sources: r.sources, times: r.times,
+             series: r.series, handover: r.handover, stats: r.stats,
+             meta: r.meta };
+  }
+  return null;
+}
+
+async function exportHTML() {
+  if (!state.run) { setStatus("先に測定データを読み込んでください"); return; }
+  setStatus("HTMLを書き出しています…");
+  const full = await fullResolutionRun();
+  if (!full) { setStatus("書き出せるデータがありません"); return; }
+  const payload = {
+    v: 1,
+    label: full.label,
+    sources: full.sources || [],
+    meta: full.meta || {},
+    times: full.times,
+    series: full.series,
+    handover: full.handover || null,
+    stats: full.stats || null,
+    buildings: state.bld.list, buildingsMeta: state.bld.meta,
+    obs: state.obs.list.length
+      ? state.obs.list.map((e, i) => state.obs.grids.get(i)).filter(Boolean)
+      : (full.obsLocal || []),
+    antennaHeight: +$("#povH").value || 2.6,
+    hpbw: +$("#povHpbw").value || 2.6,
+  };
+  const json = JSON.stringify(payload);
+  const packed = await gzipB64(json);
+
+  // 文字列置換で <script> を差し込むと、このスクリプト自身の中にある
+  // "</body>" に当たってしまう。DOMに足してから丸ごと直列化する
+  const old = document.getElementById(DATA_TAG);
+  if (old) old.remove();
+  const tag = document.createElement("script");
+  tag.id = DATA_TAG;
+  tag.type = packed ? "application/gzip-base64" : "application/json";
+  tag.textContent = packed || json.replace(/<\//g, "<\\/");
+  document.body.appendChild(tag);
+  // outerHTML は <html> から始まるので、DOCTYPE だけを足す
+  const out = "<!DOCTYPE html>\n" + document.documentElement.outerHTML;
+  tag.remove();
+  if (old) document.body.appendChild(old);
+  const name = (full.label || "leo").replace(/[^\w.-]+/g, "_") + "_viewer.html";
+  download(name, out, "text/html;charset=utf-8");
+  setStatus(`${name} を保存しました(${(out.length / 1e6).toFixed(1)} MB)。`
+    + "このファイルを開くだけで、同じ画面が読み込みなしで出ます");
+}
+$("#exportHtml").onclick = () => exportHTML();
+
+async function loadEmbedded() {
+  const tag = document.getElementById(DATA_TAG);
+  if (!tag) return false;
+  try {
+    const text = tag.type === "application/json"
+      ? tag.textContent : await ungzipB64(tag.textContent.trim());
+    const d = JSON.parse(text);
+    // 障害物マップは obsLocal として渡す。applyRun が state.obs を組み立て
+    // 直すので、ここで直接代入すると上書きされてしまう
+    state.full = { label: d.label, sources: d.sources, meta: d.meta,
+                   times: d.times, series: d.series, handover: d.handover,
+                   stats: d.stats, obsLocal: d.obs || [] };
+    if (d.antennaHeight) $("#povH").value = d.antennaHeight;
+    if (d.hpbw) $("#povHpbw").value = d.hpbw;
+    applyStep();
+    applyBuildings(d.buildings && d.buildings.length
+      ? { buildings: d.buildings, meta: d.buildingsMeta || {} } : null);
+    setStatus(`${d.label}(埋め込みデータ / ${d.times.length} サンプル`
+      + `${d.buildings && d.buildings.length ? " / 建物 " + d.buildings.length + " 棟" : ""})`
+      + " — 粒度と再生速度は自由に変えられます");
+    return true;
+  } catch (e) {
+    setStatus("埋め込みデータを読めませんでした: " + e.message);
+    return false;
+  }
+}
+
 // ---------- boot ----------
 window.addEventListener("resize", () => { if (state.run) render(); });
 const initial = new URLSearchParams(location.search).get("path");
-if (initial) { $("#pathInput").value = initial; loadRun(initial); }
-else {
-  $("#pathInput").value = "";
-  setStatus(SERVER_MODE
-    ? "「データを選択…」からCSVのフォルダを選んでください"
-    : "「データを選択…」で測定フォルダを選んでください(Pythonなしで動作中)");
+function boot() {
+  loadEmbedded().then(embedded => {
+    if (embedded) return;
+    if (initial) { $("#pathInput").value = initial; loadRun(initial); }
+    else {
+      $("#pathInput").value = "";
+      setStatus(SERVER_MODE
+        ? "「データを選択…」からCSVのフォルダを選んでください"
+        : "「データを選択…」で測定フォルダを選んでください(Pythonなしで動作中)");
+    }
+  });
 }
+// 書き出したHTMLではデータのタグがこのスクリプトより後ろに来るので、
+// 解析が終わるまで待ってから探す
+if (document.readyState === "loading")
+  document.addEventListener("DOMContentLoaded", boot);
+else boot();
 </script>
 </body>
 </html>
