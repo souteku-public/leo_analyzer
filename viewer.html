@@ -68,7 +68,7 @@ dialog::backdrop{background:rgba(0,0,0,.45)}
   <input id="fileInput" type="file" multiple accept=".csv,.gz,.jsonl,.json" hidden>
   <input id="dirInput" type="file" webkitdirectory directory hidden>
   <button id="addSrc" title="別の測定を重ねて比較します(StarlinkとKymetaなど)">比較用に追加…</button>
-  <input id="addInput" type="file" multiple accept=".csv,.gz,.jsonl,.json" hidden>
+  <input id="addInput" type="file" webkitdirectory directory hidden>
   <button id="bldPick" title="PLATEAUのCityGML(.gml)か、変換済みのbuildings.json">建物(PLATEAU)…</button>
   <input id="bldInput" type="file" multiple accept=".gml,.json" hidden>
   <button id="exportHtml" title="測定データと建物を埋め込んだHTMLを保存。次回はそれを開くだけで同じ画面が出ます">HTMLで書き出す</button>
@@ -102,7 +102,7 @@ dialog::backdrop{background:rgba(0,0,0,.45)}
   <section class="card full">
     <div class="tiles" id="tiles"></div>
     <canvas id="strip" height="150"></canvas>
-    <div class="legend">
+    <div class="legend" id="legendSingle">
       <span><span class="sw" style="background:var(--s1)"></span>下り Mbps</span>
       <span><span class="sw" style="background:var(--s2)"></span>上り Mbps</span>
       <span><span class="sw" style="background:var(--s3)"></span>RTT ms</span>
@@ -111,7 +111,11 @@ dialog::backdrop{background:rgba(0,0,0,.45)}
       <span><span class="sw" style="background:var(--s5)"></span>降水 mm/h</span>
       <span class="muted">縦線=再生位置。クリックでその時刻へ移動。
         横の破線=その系列の平均</span>
-      <span id="cmpInfo" class="muted"></span>
+    </div>
+    <div class="legend" id="legendCmp" style="display:none">
+      <span id="cmpLegend"></span>
+      <span class="muted">実線=下り / 破線=上り。縦線=再生位置。
+        横の破線=その回線の平均</span>
     </div>
     <div class="legend"><span id="statsInfo" class="muted"></span></div>
     <div class="legend" id="hoLegend" style="display:none">
@@ -308,8 +312,10 @@ const state = {
   track: null,                                    // 1秒ごとに内挿した位置
   runs: [],                                       // 比較用に読み込んだソース
 };
-// 比較モードでは同じ指標を重ねる。色は指標ごとに固定し、
-// ソースの区別は線種(実線/破線)で行う — 色まで変えると読めなくなる
+// 比較はスループットだけを見るので、指標が2つ(下り/上り)しかない。
+// そのぶん色をアンテナの識別に使い、下り/上りは線種で分ける
+const SRC_COLORS = ["--s1", "--s2", "--s3", "--s4"];
+const CMP_CHANS = [["down_mbps", []], ["up_mbps", [6, 4]]];
 const SRC_DASH = [[], [6, 4], [2, 3], [10, 4]];
 
 // StarlinkはUTCの15秒グリッド(:00/:15/:30/:45)でスケジューリングしており、
@@ -354,10 +360,14 @@ function applyRun(run) {
   state.liveHome = null; state.homeManual = null;   // 前回のデータを持ち越さない
   $("#statsInfo").textContent = statsLine(run);
   const cmp = run.cmp || [];
-  $("#cmpInfo").textContent = cmp.length > 1
-    ? "比較中: " + cmp.map((c, i) => `${"ABCD"[i]}=${c.label}`).join(" / ")
-      + "(A=実線, B=破線。同じ指標は同じ色・同じ縦スケール)"
-    : "";
+  const multi = cmp.length > 1;
+  $("#legendSingle").style.display = multi ? "none" : "";
+  $("#legendCmp").style.display = multi ? "" : "none";
+  if (multi) {
+    $("#cmpLegend").innerHTML = cmp.map((c, i) =>
+      `<span style="margin-right:14px"><span class="sw" style="background:var(${
+        SRC_COLORS[i % SRC_COLORS.length]})"></span>${c.label}</span>`).join("");
+  }
   const ho = state.handover = run.handover || null;
   $("#hoLegend").style.display = ho ? "" : "none";
   if (ho) {
@@ -1470,9 +1480,12 @@ function drawTiles() {
   const srcs = state.run.cmp || [{ series: state.run.series,
                                    stats: state.run.stats || {} }];
   const multi = srcs.length > 1;
+  // 比較モードで見るのはスループットだけ
+  const keys = multi ? ["down_mbps", "up_mbps"]
+    : ["down_mbps", "up_mbps", "rtt_ms", "snr_db", "speed",
+       "clearance_deg", "rain_mm"];
   // 現在値と、その系列の全区間平均を並べる。平均は間引きの影響を受けない
-  const tiles = ["down_mbps", "up_mbps", "rtt_ms", "snr_db", "speed",
-                 "clearance_deg", "rain_mm"]
+  const tiles = keys
     .map(key => {
       const [label, unit] = STAT_LABEL[key];
       const rows = srcs.map(src => {
@@ -1482,10 +1495,14 @@ function drawTiles() {
         return (now == null && !st) ? null : { now, st };
       });
       if (!rows.some(Boolean)) return "";
-      const nowTxt = rows.map(r => r && r.now != null ? fmtVal(r.now, unit) : "—")
-                         .join(multi ? " / " : "");
-      const avgTxt = rows.map(r => r && r.st ? fmtVal(r.st.mean, unit) : "—")
-                         .join(multi ? " / " : "");
+      // 比較モードは回線ごとに色を付ける(どちらの数字か一目で分かるように)
+      const tint = (txt, si) => multi
+        ? `<span style="color:var(${SRC_COLORS[si % SRC_COLORS.length]})">${txt}</span>`
+        : txt;
+      const nowTxt = rows.map((r, i) =>
+        tint(r && r.now != null ? fmtVal(r.now, unit) : "—", i)).join(multi ? " / " : "");
+      const avgTxt = rows.map((r, i) =>
+        tint(r && r.st ? fmtVal(r.st.mean, unit) : "—", i)).join(multi ? " / " : "");
       return `<div class="tile"><div class="k">${label}</div><div class="v">${
         nowTxt}<span class="u">${unit}</span></div>` +
         `<div class="k">平均 ${avgTxt}<span class="u">${unit}</span></div></div>`;
@@ -1495,14 +1512,15 @@ function drawTiles() {
 }
 
 // グラフ下に平均値をテキストでも出す(最大・最小つき)
-function statsLine(run) {
+function statsLine(run, only) {
   const srcs = run.cmp || [];
   if (srcs.length > 1) {
-    return srcs.map((s, i) => "ABCD"[i] + " " + s.label + ": "
-      + statsLine({ stats: s.stats }).replace(/^平均値: /, "")).join("\n");
+    return srcs.map(s => s.label + ": "
+      + statsLine({ stats: s.stats }, ["down_mbps", "up_mbps"])
+          .replace(/^平均値: /, "")).join("\n");
   }
   const stats = run.stats || {};
-  const parts = STAT_KEYS.filter(k => stats[k]).map(key => {
+  const parts = (only || STAT_KEYS).filter(k => stats[k]).map(key => {
     const st = stats[key], [label, unit] = STAT_LABEL[key];
     return `${label} 平均 ${fmtVal(st.mean, unit)}${unit}` +
            `(最小 ${fmtVal(st.min, unit)} / 最大 ${fmtVal(st.max, unit)}` +
@@ -1537,18 +1555,33 @@ function drawStrip() {
   g.moveTo(pad.l, pad.t + plot.h); g.lineTo(w - pad.r, pad.t + plot.h); g.stroke();
   const srcs = state.run.cmp || [{ series: state.run.series,
                                    stats: state.run.stats || {} }];
-  chans.forEach(([key, col], ci) => {
+  const multi = srcs.length > 1;
+  // 比較モードは下り/上りだけを見る。色はアンテナ、線種が下り/上り
+  const plan = multi ? CMP_CHANS.map(([key, dash]) => ({ key, dash }))
+                     : chans.map(([key, col]) => ({ key, col, dash: [] }));
+  // 比較モードは下りも上りも Mbps なので、4本すべてを共通スケールに載せる。
+  // 指標ごとに正規化すると、22Mbpsの上りが180Mbpsの下りより上に来てしまう
+  let shared = null;
+  if (multi) {
+    const all = [];
+    plan.forEach(ch => srcs.forEach(s =>
+      (s.series[ch.key] || []).forEach(v => { if (v != null) all.push(v); })));
+    if (all.length) shared = [Math.min(0, ...all), Math.max(...all)];
+  }
+  plan.forEach((ch, ci) => {
+    const key = ch.key;
     // 同じ指標は全ソースで同じ縦スケールに載せる。別々に正規化すると
     // 「どちらが速いか」が読めなくなる
     const all = [];
     srcs.forEach(s => (s.series[key] || []).forEach(v => { if (v != null) all.push(v); }));
     if (!all.length) return;
-    const lo = Math.min(0, ...all), hi = Math.max(...all);
+    const lo = shared ? shared[0] : Math.min(0, ...all);
+    const hi = shared ? shared[1] : Math.max(...all);
     const span = (hi - lo) || 1;
     const yOf = v => pad.t + plot.h * (1 - (v - lo) / span);
     srcs.forEach((src, si) => {
       const s = src.series[key]; if (!s || !s.some(v => v != null)) return;
-      const dash = SRC_DASH[si % SRC_DASH.length];
+      const col = multi ? SRC_COLORS[si % SRC_COLORS.length] : ch.col;
       const st = (src.stats || {})[key];
       if (st) {   // 平均を同じスケールの水平破線で重ねる
         const y = yOf(st.mean);
@@ -1558,12 +1591,13 @@ function drawStrip() {
         g.setLineDash([]); g.globalAlpha = 1;
         g.fillStyle = css(col); g.font = "10px system-ui";
         // 系列ごとに横位置と上下をずらす(平均が近いとラベルが重なるため)
-        g.fillText((srcs.length > 1 ? "ABCD"[si] + " " : "") + "平均 "
+        const slot = multi ? si * 2 + ci : ci;
+        g.fillText((multi ? STAT_LABEL[key][0] + " " : "") + "平均 "
                    + fmtVal(st.mean, STAT_LABEL[key][1]),
-                   pad.l + 4 + ci * 96, y + (ci % 2 ? 10 : -3));
+                   pad.l + 4 + slot * 96, y + (slot % 2 ? 10 : -3));
       }
       g.strokeStyle = css(col); g.lineWidth = 1.5;
-      g.setLineDash(dash); g.globalAlpha = si ? .85 : 1;
+      g.setLineDash(ch.dash);
       g.beginPath();
       let pen = false;
       s.forEach((v, i) => {
@@ -1572,7 +1606,7 @@ function drawStrip() {
         const y = yOf(v);
         pen ? g.lineTo(x, y) : g.moveTo(x, y); pen = true;
       });
-      g.stroke(); g.setLineDash([]); g.globalAlpha = 1;
+      g.stroke(); g.setLineDash([]);
     });
   });
   const x = pad.l + plot.w * (state.idx / Math.max(1, n - 1));
