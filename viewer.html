@@ -10,11 +10,12 @@
   --surface:#fcfcfb; --page:#f9f9f7; --ink:#0b0b0b; --ink-2:#52514e;
   --muted:#898781; --grid:#e1e0d9; --axis:#c3c2b7; --border:rgba(11,11,11,.10);
   --s1:#2a78d6; --s2:#eb6834; --s3:#1baf7a; --s4:#eda100; --crit:#d03b3b;
+  --s5:#6b53c9;
 }
 @media (prefers-color-scheme:dark){:root{
   --surface:#1a1a19; --page:#0d0d0d; --ink:#fff; --ink-2:#c3c2b7;
   --grid:#2c2c2a; --axis:#383835; --border:rgba(255,255,255,.10);
-  --s1:#3987e5; --s2:#d95926; --s3:#199e70; --s4:#c98500;
+  --s1:#3987e5; --s2:#d95926; --s3:#199e70; --s4:#c98500; --s5:#8b76e8;
 }}
 *{box-sizing:border-box}
 body{margin:0;background:var(--page);color:var(--ink);
@@ -104,6 +105,7 @@ dialog::backdrop{background:rgba(0,0,0,.45)}
       <span><span class="sw" style="background:var(--s3)"></span>RTT ms</span>
       <span><span class="sw" style="background:var(--s4)"></span>SINR dB</span>
       <span><span class="sw" style="background:var(--ink-2)"></span>クリアランス°(PLATEAU)</span>
+      <span><span class="sw" style="background:var(--s5)"></span>降水 mm/h</span>
       <span class="muted">縦線=再生位置。クリックでその時刻へ移動。
         横の破線=その系列の平均</span>
     </div>
@@ -390,7 +392,7 @@ function applyRun(run) {
 // アイドル区間や上り区間まで含めて取ると本来の値が埋もれる
 const STAT_PHASE = { down_mbps: "download", up_mbps: "upload" };
 const STAT_KEYS = ["down_mbps", "up_mbps", "rtt_ms", "snr_db", "loss", "speed",
-                   "clearance_deg"];
+                   "clearance_deg", "rain_mm"];
 
 // 平均・最大・最小。必ず間引く前の全サンプルを渡すこと
 function seriesStats(rows) {
@@ -1409,14 +1411,15 @@ const STAT_LABEL = { down_mbps: ["下り", "Mbps"], up_mbps: ["上り", "Mbps"],
                      // ロス率は0の秒が記録されないので、平均は「損失が
                      // 出た秒だけ」の平均になる。誤読しないよう明示する
                      loss: ["ロス率(発生秒のみ)", ""], speed: ["速度", "m/s"],
-                     clearance_deg: ["クリアランス", "°"] };
+                     clearance_deg: ["クリアランス", "°"],
+                     rain_mm: ["降水", "mm/h"] };
 const fmtVal = (v, unit) => (+v).toFixed(unit === "Mbps" ? 1 : unit === "" ? 3 : 2);
 
 function drawTiles() {
   const stats = state.run.stats || {};
   // 現在値と、その系列の全区間平均を並べる。平均は間引きの影響を受けない
   const tiles = ["down_mbps", "up_mbps", "rtt_ms", "snr_db", "speed",
-                 "clearance_deg"]
+                 "clearance_deg", "rain_mm"]
     .map(key => {
       const now = cur(key), st = stats[key];
       if (now == null && !st) return "";
@@ -1463,7 +1466,7 @@ function drawStrip() {
   const plot = { w: w - pad.l - pad.r, h: h - pad.t - pad.b };
   const chans = [["down_mbps", "--s1"], ["up_mbps", "--s2"],
                  ["rtt_ms", "--s3"], ["snr_db", "--s4"],
-                 ["clearance_deg", "--ink-2"]];
+                 ["clearance_deg", "--ink-2"], ["rain_mm", "--s5"]];
   const xOf = i => pad.l + plot.w * (i / Math.max(1, n - 1));
   drawHandoverMarks(g, pad, plot, n, xOf);
   g.strokeStyle = css("--grid"); g.beginPath();
@@ -2014,7 +2017,7 @@ function jmaTile(base, z, x, y) {
 const _rainTiles = {};
 // 単体モード: Open-Meteo を直接(CORS許可あり)。7x7グリッドを一括取得
 async function rainDirect(lat, lon, epoch) {
-  const N = 7, SPAN = 1.0, half = SPAN / 2;
+  const N = 13, SPAN = 0.36, half = SPAN / 2;   // 約40km四方を3.3km間隔
   const lonScale = 1 / Math.max(Math.cos(lat * Math.PI / 180), 0.2);
   const lats = [], lons = [];
   for (let i = 0; i < N; i++) {
@@ -2053,7 +2056,47 @@ async function rainDirect(lat, lon, epoch) {
            source: ageDays <= 90 ? "Open-Meteo (実況/予報)" : "Open-Meteo (ERA5)",
            available: grid.some(v => v != null) };
 }
+// 測定期間ぶんの降水量を1点で取り、時系列としてグラフに重ねる。
+// 地図の重ね描きは「その瞬間」しか見えないので、夕立と回線品質の
+// 前後関係を見るにはこちらが要る
+async function fetchRainSeries() {
+  const full = state.full, home = activeHome();
+  if (!full || !home || state.rainSeriesAt === full.times[0]) return;
+  if ($("#rainSrc").value === "off") return;
+  state.rainSeriesAt = full.times[0];
+  const t0 = full.times[0], t1 = full.times[full.times.length - 1];
+  const ageDays = Math.floor((Date.now() - t0 * 1000) / 86400e3);
+  const q = new URLSearchParams({ latitude: home.lat.toFixed(4),
+    longitude: home.lon.toFixed(4), hourly: "precipitation", timezone: "UTC" });
+  let base = "https://api.open-meteo.com/v1/forecast";
+  if (ageDays <= 90) {
+    q.set("past_days", String(Math.max(1, Math.min(92, ageDays + 2))));
+    q.set("forecast_days", "1");
+  } else {
+    base = "https://archive-api.open-meteo.com/v1/archive";
+    q.set("start_date", new Date(t0 * 1000).toISOString().slice(0, 10));
+    q.set("end_date", new Date((t1 + 86400) * 1000).toISOString().slice(0, 10));
+  }
+  let hourly;
+  try {
+    hourly = (await (await fetch(base + "?" + q)).json()).hourly;
+  } catch (e) { return; }
+  if (!hourly || !hourly.time) return;
+  const byHour = new Map();
+  hourly.time.forEach((h, i) => byHour.set(h, hourly.precipitation[i]));
+  const at = t => byHour.get(new Date(t * 1000).toISOString().slice(0, 13) + ":00");
+  const values = full.times.map(t => { const v = at(t); return v == null ? null : v; });
+  if (!values.some(v => v != null)) return;
+  full.series.rain_mm = values;
+  const v = values.filter(x => x != null);
+  full.stats = full.stats || {};
+  full.stats.rain_mm = { mean: v.reduce((a, b) => a + b, 0) / v.length,
+    min: Math.min(...v), max: Math.max(...v), n: v.length, phase: null };
+  applyStep();
+}
+
 async function maybeFetchRain(t) {
+  fetchRainSeries();
   const mode = $("#rainSrc").value;
   if (mode === "off") { state.rain = null; state.jma = null; drawMap(); return; }
   const home = activeHome(); if (!home) return;

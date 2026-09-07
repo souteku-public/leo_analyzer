@@ -14,8 +14,11 @@ from datetime import datetime, timedelta, timezone
 
 FORECAST_URL = "https://api.open-meteo.com/v1/forecast"
 ARCHIVE_URL = "https://archive-api.open-meteo.com/v1/archive"
-GRID_N = 7          # 7x7 sample points
-GRID_SPAN_DEG = 1.0  # total span in latitude (~110 km)
+# The model behind Open-Meteo over Japan (JMA MSM) is on a 0.05 deg grid,
+# about 5.5 km. Sampling 40 km across at 3.3 km keeps that detail; the old
+# 7x7 over 1 deg threw most of it away at 18 km spacing.
+GRID_N = 13
+GRID_SPAN_DEG = 0.36
 _CACHE = {}
 _CACHE_TTL_S = 1800
 
