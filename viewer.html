@@ -58,6 +58,7 @@ dialog::backdrop{background:rgba(0,0,0,.45)}
 .badge{font-size:11px;color:#fff;background:var(--s3);border-radius:10px;
   padding:1px 7px}
 #status{font-size:12px;color:var(--muted)}
+#statsInfo{white-space:pre-line}
 </style>
 </head>
 <body>
@@ -66,6 +67,8 @@ dialog::backdrop{background:rgba(0,0,0,.45)}
   <button id="pick" class="primary">データを選択…</button>
   <input id="fileInput" type="file" multiple accept=".csv,.gz,.jsonl,.json" hidden>
   <input id="dirInput" type="file" webkitdirectory directory hidden>
+  <button id="addSrc" title="別の測定を重ねて比較します(StarlinkとKymetaなど)">比較用に追加…</button>
+  <input id="addInput" type="file" multiple accept=".csv,.gz,.jsonl,.json" hidden>
   <button id="bldPick" title="PLATEAUのCityGML(.gml)か、変換済みのbuildings.json">建物(PLATEAU)…</button>
   <input id="bldInput" type="file" multiple accept=".gml,.json" hidden>
   <button id="exportHtml" title="測定データと建物を埋め込んだHTMLを保存。次回はそれを開くだけで同じ画面が出ます">HTMLで書き出す</button>
@@ -108,6 +111,7 @@ dialog::backdrop{background:rgba(0,0,0,.45)}
       <span><span class="sw" style="background:var(--s5)"></span>降水 mm/h</span>
       <span class="muted">縦線=再生位置。クリックでその時刻へ移動。
         横の破線=その系列の平均</span>
+      <span id="cmpInfo" class="muted"></span>
     </div>
     <div class="legend"><span id="statsInfo" class="muted"></span></div>
     <div class="legend" id="hoLegend" style="display:none">
@@ -302,7 +306,11 @@ const state = {
   handover: null,
   bld: { list: [], meta: {}, prepared: null },   // PLATEAUの建物
   track: null,                                    // 1秒ごとに内挿した位置
+  runs: [],                                       // 比較用に読み込んだソース
 };
+// 比較モードでは同じ指標を重ねる。色は指標ごとに固定し、
+// ソースの区別は線種(実線/破線)で行う — 色まで変えると読めなくなる
+const SRC_DASH = [[], [6, 4], [2, 3], [10, 4]];
 
 // StarlinkはUTCの15秒グリッド(:00/:15/:30/:45)でスケジューリングしており、
 // 切り替えはその境界でしか始まらない。ただし「15秒ごとに必ず切り替わる」
@@ -345,6 +353,11 @@ function applyRun(run) {
   state.sats = {}; state.rain = null; state.satAt = null; state.rainAt = null;
   state.liveHome = null; state.homeManual = null;   // 前回のデータを持ち越さない
   $("#statsInfo").textContent = statsLine(run);
+  const cmp = run.cmp || [];
+  $("#cmpInfo").textContent = cmp.length > 1
+    ? "比較中: " + cmp.map((c, i) => `${"ABCD"[i]}=${c.label}`).join(" / ")
+      + "(A=実線, B=破線。同じ指標は同じ色・同じ縦スケール)"
+    : "";
   const ho = state.handover = run.handover || null;
   $("#hoLegend").style.display = ho ? "" : "none";
   if (ho) {
@@ -505,7 +518,7 @@ async function parseObstruction(file) {
   return out;
 }
 
-async function loadFiles(all) {
+async function loadFiles(all, append) {
   const obsFiles = Array.from(all).filter(f => /obstruction.*\.jsonl(\.gz)?$/i.test(f.name));
   const bldFile = Array.from(all).find(f => /^buildings\.json$/i.test(f.name));
   const files = Array.from(all).filter(f => /\.csv(\.gz)?$/i.test(f.name));
@@ -560,30 +573,66 @@ async function loadFiles(all) {
   if (obsLocal) obsLocal.sort((a, b) => a.epoch - b.epoch);
   // 1秒解像度のまま保持する。粒度を変えるたびにファイルを読み直さずに
   // 済み、HTML書き出しでも元の解像度を保てる
-  state.full = {
-    label: files[0].webkitRelativePath?.split("/")[0] || files[0].name,
+  // ラベルはフォルダ名 > summary.json の label > ファイル名 の順で決める。
+  // 同名になると A/B の区別がつかないので、重なったら連番を足す
+  let label = files[0].webkitRelativePath?.split("/")[0] || null;
+  const sj = Array.from(all).find(f => /^summary\.json$/i.test(f.name));
+  if (!label && sj) {
+    try { label = (JSON.parse(await sj.text()) || {}).label || null; }
+    catch (e) { /* 壊れていても致命的ではない */ }
+  }
+  label = label || files[0].name;
+  if (append) {
+    const taken = state.runs.map(r => r.label);
+    if (taken.includes(label)) {
+      let k = 2;
+      while (taken.includes(`${label} (${k})`)) k++;
+      label = `${label} (${k})`;
+    }
+  }
+  const entry = {
+    label,
     sources: used.map(f => ({ file: f })), times, series, handover, stats,
     obsLocal, bldLocal,
   };
-  state.lastFiles = all;
+  if (append && state.runs.length) state.runs.push(entry);
+  else { state.runs = [entry]; state.lastFiles = all; }
+  state.full = state.runs[0];
   applyStep();
 }
+$("#addSrc").onclick = () => {
+  if (!state.runs.length) { setStatus("先に1つ目の測定を読み込んでください"); return; }
+  $("#addInput").click();
+};
+$("#addInput").onchange = e => loadFiles([...e.target.files], true);
 
-// 1秒解像度の state.full から、指定の粒度で表示用データを作る
+// 読み込んだ全ソースを、指定の粒度で1本の時間軸に載せる。
+// 時刻は和集合を取る — 片方だけ長い測定でも切り落とさない
 function applyStep() {
-  const full = state.full;
-  if (!full) return;
+  const runs = state.runs;
+  if (!runs.length) return;
+  const full = state.full = runs[0];
   const step = +$("#step").value;
-  let times = full.times;
+  const all = new Set();
+  runs.forEach(r => r.times.forEach(t => all.add(t)));
+  let times = [...all].sort((a, b) => a - b);
   if (step > 1) {
     const kept = []; let next = times[0];
     for (const t of times) if (t >= next) { kept.push(t); next = t + step; }
     times = kept;
   }
-  const idx = new Map(full.times.map((t, i) => [t, i]));
-  const series = {};
-  for (const [k, arr] of Object.entries(full.series))
-    series[k] = times.map(t => arr[idx.get(t)]);
+  // ソースごとに同じ時間軸へ載せ直す。ここで分けて持つので、
+  // 同名の列(mbps_down など)が上書きし合うことはない
+  const align = r => {
+    const idx = new Map(r.times.map((t, i) => [t, i]));
+    const out = {};
+    for (const [k, arr] of Object.entries(r.series))
+      out[k] = times.map(t => { const i = idx.get(t); return i == null ? null : arr[i]; });
+    return out;
+  };
+  const cmp = runs.map((r, i) => ({ label: r.label, i, series: align(r),
+                                    stats: r.stats, handover: r.handover }));
+  const series = cmp[0].series;
   const pos = times.map((t, i) => [series.lat[i], series.lon[i]])
                    .filter(p => p[0] != null && p[1] != null);
   let home = null;
@@ -597,10 +646,12 @@ function applyStep() {
     home = { lat: mid, lon: pos.reduce((a, p) => a + p[1], 0) / pos.length,
              moving: Math.hypot(ns, ew) > 50 };
   }
-  applyRun({ label: full.label, path: null, meta: full.meta || {},
-             sources: full.sources || [], times, series, home, step,
-             obsLocal: full.obsLocal, handover: full.handover,
-             stats: full.stats, bldLocal: full.bldLocal });
+  applyRun({ label: runs.map(r => r.label).join(" vs "), path: null,
+             meta: full.meta || {}, sources: full.sources || [],
+             times, series, home, step, cmp,
+             obsLocal: runs.map(r => r.obsLocal).find(Boolean),
+             handover: full.handover, stats: full.stats,
+             bldLocal: runs.map(r => r.bldLocal).find(Boolean) });
 }
 
 // 走行範囲がちょうど収まるズーム(静止なら市街地スケール)
@@ -1416,20 +1467,28 @@ const STAT_LABEL = { down_mbps: ["下り", "Mbps"], up_mbps: ["上り", "Mbps"],
 const fmtVal = (v, unit) => (+v).toFixed(unit === "Mbps" ? 1 : unit === "" ? 3 : 2);
 
 function drawTiles() {
-  const stats = state.run.stats || {};
+  const srcs = state.run.cmp || [{ series: state.run.series,
+                                   stats: state.run.stats || {} }];
+  const multi = srcs.length > 1;
   // 現在値と、その系列の全区間平均を並べる。平均は間引きの影響を受けない
   const tiles = ["down_mbps", "up_mbps", "rtt_ms", "snr_db", "speed",
                  "clearance_deg", "rain_mm"]
     .map(key => {
-      const now = cur(key), st = stats[key];
-      if (now == null && !st) return "";
       const [label, unit] = STAT_LABEL[key];
-      const avg = st
-        ? `<div class="k">平均 ${fmtVal(st.mean, unit)}` +
-          `<span class="u">${unit}</span></div>` : "";
+      const rows = srcs.map(src => {
+        const arr = src.series[key] || [];
+        const st = (src.stats || {})[key];
+        const now = arr[state.idx];
+        return (now == null && !st) ? null : { now, st };
+      });
+      if (!rows.some(Boolean)) return "";
+      const nowTxt = rows.map(r => r && r.now != null ? fmtVal(r.now, unit) : "—")
+                         .join(multi ? " / " : "");
+      const avgTxt = rows.map(r => r && r.st ? fmtVal(r.st.mean, unit) : "—")
+                         .join(multi ? " / " : "");
       return `<div class="tile"><div class="k">${label}</div><div class="v">${
-        now == null ? "—" : fmtVal(now, unit)
-      }<span class="u">${unit}</span></div>${avg}</div>`;
+        nowTxt}<span class="u">${unit}</span></div>` +
+        `<div class="k">平均 ${avgTxt}<span class="u">${unit}</span></div></div>`;
     }).join("");
   $("#tiles").innerHTML = tiles ||
     '<span class="muted">この時刻のデータはありません</span>';
@@ -1437,6 +1496,11 @@ function drawTiles() {
 
 // グラフ下に平均値をテキストでも出す(最大・最小つき)
 function statsLine(run) {
+  const srcs = run.cmp || [];
+  if (srcs.length > 1) {
+    return srcs.map((s, i) => "ABCD"[i] + " " + s.label + ": "
+      + statsLine({ stats: s.stats }).replace(/^平均値: /, "")).join("\n");
+  }
   const stats = run.stats || {};
   const parts = STAT_KEYS.filter(k => stats[k]).map(key => {
     const st = stats[key], [label, unit] = STAT_LABEL[key];
@@ -1471,36 +1535,45 @@ function drawStrip() {
   drawHandoverMarks(g, pad, plot, n, xOf);
   g.strokeStyle = css("--grid"); g.beginPath();
   g.moveTo(pad.l, pad.t + plot.h); g.lineTo(w - pad.r, pad.t + plot.h); g.stroke();
-  const stats = state.run.stats || {};
+  const srcs = state.run.cmp || [{ series: state.run.series,
+                                   stats: state.run.stats || {} }];
   chans.forEach(([key, col], ci) => {
-    const s = state.run.series[key]; if (!s || !s.some(v => v != null)) return;
-    const vals = s.filter(v => v != null);
-    // SINRもクリアランスも負になる。0からの比で描くと枠外にはみ出すので
-    // 実際の下限〜上限でスケールする
-    const lo = Math.min(0, ...vals), hi = Math.max(...vals);
+    // 同じ指標は全ソースで同じ縦スケールに載せる。別々に正規化すると
+    // 「どちらが速いか」が読めなくなる
+    const all = [];
+    srcs.forEach(s => (s.series[key] || []).forEach(v => { if (v != null) all.push(v); }));
+    if (!all.length) return;
+    const lo = Math.min(0, ...all), hi = Math.max(...all);
     const span = (hi - lo) || 1;
     const yOf = v => pad.t + plot.h * (1 - (v - lo) / span);
-    const st = stats[key];
-    if (st) {   // 平均を同じスケールの水平破線で重ねる
-      const y = yOf(st.mean);
-      g.strokeStyle = css(col); g.lineWidth = 1;
-      g.setLineDash([5, 4]); g.globalAlpha = .55;
-      g.beginPath(); g.moveTo(pad.l, y); g.lineTo(w - pad.r, y); g.stroke();
-      g.setLineDash([]); g.globalAlpha = 1;
-      g.fillStyle = css(col); g.font = "10px system-ui";
-      // 系列ごとに横位置と上下をずらす(平均が近いとラベルが重なるため)
-      g.fillText("平均 " + fmtVal(st.mean, STAT_LABEL[key][1]),
-                 pad.l + 4 + ci * 96, y + (ci % 2 ? 10 : -3));
-    }
-    g.strokeStyle = css(col); g.lineWidth = 1.5; g.beginPath();
-    let pen = false;
-    s.forEach((v, i) => {
-      if (v == null) { pen = false; return; }
-      const x = pad.l + plot.w * (i / Math.max(1, n - 1));
-      const y = yOf(v);
-      pen ? g.lineTo(x, y) : g.moveTo(x, y); pen = true;
+    srcs.forEach((src, si) => {
+      const s = src.series[key]; if (!s || !s.some(v => v != null)) return;
+      const dash = SRC_DASH[si % SRC_DASH.length];
+      const st = (src.stats || {})[key];
+      if (st) {   // 平均を同じスケールの水平破線で重ねる
+        const y = yOf(st.mean);
+        g.strokeStyle = css(col); g.lineWidth = 1;
+        g.setLineDash([5, 4]); g.globalAlpha = .55;
+        g.beginPath(); g.moveTo(pad.l, y); g.lineTo(w - pad.r, y); g.stroke();
+        g.setLineDash([]); g.globalAlpha = 1;
+        g.fillStyle = css(col); g.font = "10px system-ui";
+        // 系列ごとに横位置と上下をずらす(平均が近いとラベルが重なるため)
+        g.fillText((srcs.length > 1 ? "ABCD"[si] + " " : "") + "平均 "
+                   + fmtVal(st.mean, STAT_LABEL[key][1]),
+                   pad.l + 4 + ci * 96, y + (ci % 2 ? 10 : -3));
+      }
+      g.strokeStyle = css(col); g.lineWidth = 1.5;
+      g.setLineDash(dash); g.globalAlpha = si ? .85 : 1;
+      g.beginPath();
+      let pen = false;
+      s.forEach((v, i) => {
+        if (v == null) { pen = false; return; }
+        const x = pad.l + plot.w * (i / Math.max(1, n - 1));
+        const y = yOf(v);
+        pen ? g.lineTo(x, y) : g.moveTo(x, y); pen = true;
+      });
+      g.stroke(); g.setLineDash([]); g.globalAlpha = 1;
     });
-    g.stroke();
   });
   const x = pad.l + plot.w * (state.idx / Math.max(1, n - 1));
   g.strokeStyle = css("--crit"); g.lineWidth = 1.5;
@@ -1860,18 +1933,23 @@ function drawMap() {
       g.fillRect(px, py, pw, ph); g.globalAlpha = 1;
     }
   }
-  // track + marker
-  const S = state.run && state.run.series;
-  if (S && S.lat) {
-    g.strokeStyle = css("--s3"); g.lineWidth = 2; g.beginPath();
+  // track + marker。比較モードではソースごとに線種を変える。
+  // 同じ車両に載せた2台なら軌跡は重なり、1本に見える
+  const tracks = state.run && (state.run.cmp || [{ series: state.run.series }]);
+  (tracks || []).forEach((src, si) => {
+    const S = src.series;
+    if (!S || !S.lat) return;
+    g.strokeStyle = css("--s3"); g.lineWidth = 2;
+    g.setLineDash(SRC_DASH[si % SRC_DASH.length]);
+    g.beginPath();
     let pen = false;
     for (let i = 0; i < S.lat.length; i++) {
       if (S.lat[i] == null) { pen = false; continue; }
       const px = lonToX(S.lon[i], z) * TS - x0, py = latToY(S.lat[i], z) * TS - y0;
       pen ? g.lineTo(px, py) : g.moveTo(px, py); pen = true;
     }
-    g.stroke();
-  }
+    g.stroke(); g.setLineDash([]);
+  });
   const mx = lonToX(home.lon, z) * TS - x0, my = latToY(home.lat, z) * TS - y0;
   if (known) {
     g.fillStyle = css("--crit"); g.beginPath(); g.arc(mx, my, 6, 0, 7); g.fill();
@@ -2171,32 +2249,30 @@ async function ungzipB64(b64) {
   return await new Response(stream).text();
 }
 
-async function fullResolutionRun() {
-  if (state.full) return state.full;
+async function fullResolutionSources() {
+  if (state.runs.length) return state.runs;
   // サーバー版は表示用に間引かれているので、書き出し時だけ1秒で取り直す
   if (state.run && state.run.path) {
     const r = await api("/api/load", { path: state.run.path, step: 1 });
-    return { label: r.label, sources: r.sources, times: r.times,
-             series: r.series, handover: r.handover, stats: r.stats,
-             meta: r.meta };
+    return [{ label: r.label, sources: r.sources, times: r.times,
+              series: r.series, handover: r.handover, stats: r.stats,
+              meta: r.meta }];
   }
-  return null;
+  return [];
 }
 
 async function exportHTML() {
   if (!state.run) { setStatus("先に測定データを読み込んでください"); return; }
   setStatus("HTMLを書き出しています…");
-  const full = await fullResolutionRun();
-  if (!full) { setStatus("書き出せるデータがありません"); return; }
+  const runs = await fullResolutionSources();
+  if (!runs.length) { setStatus("書き出せるデータがありません"); return; }
+  const full = runs[0];
   const payload = {
-    v: 1,
-    label: full.label,
-    sources: full.sources || [],
-    meta: full.meta || {},
-    times: full.times,
-    series: full.series,
-    handover: full.handover || null,
-    stats: full.stats || null,
+    v: 2,
+    // 比較モードのソースをすべて埋め込む(v1は単一ソースだった)
+    runs: runs.map(r => ({ label: r.label, sources: r.sources || [],
+      meta: r.meta || {}, times: r.times, series: r.series,
+      handover: r.handover || null, stats: r.stats || null })),
     buildings: state.bld.list, buildingsMeta: state.bld.meta,
     obs: state.obs.list.length
       ? state.obs.list.map((e, i) => state.obs.grids.get(i)).filter(Boolean)
@@ -2220,7 +2296,8 @@ async function exportHTML() {
   const out = "<!DOCTYPE html>\n" + document.documentElement.outerHTML;
   tag.remove();
   if (old) document.body.appendChild(old);
-  const name = (full.label || "leo").replace(/[^\w.-]+/g, "_") + "_viewer.html";
+  const name = (runs.map(r => r.label).join("_vs_") || "leo")
+    .replace(/[^\w.-]+/g, "_").slice(0, 80) + "_viewer.html";
   download(name, out, "text/html;charset=utf-8");
   setStatus(`${name} を保存しました(${(out.length / 1e6).toFixed(1)} MB)。`
     + "このファイルを開くだけで、同じ画面が読み込みなしで出ます");
@@ -2236,15 +2313,19 @@ async function loadEmbedded() {
     const d = JSON.parse(text);
     // 障害物マップは obsLocal として渡す。applyRun が state.obs を組み立て
     // 直すので、ここで直接代入すると上書きされてしまう
-    state.full = { label: d.label, sources: d.sources, meta: d.meta,
-                   times: d.times, series: d.series, handover: d.handover,
-                   stats: d.stats, obsLocal: d.obs || [] };
+    const runs = d.runs || [d];          // v1(単一ソース)も読めるようにしておく
+    state.runs = runs.map((r, i) => ({ label: r.label, sources: r.sources,
+      meta: r.meta, times: r.times, series: r.series, handover: r.handover,
+      stats: r.stats, obsLocal: i === 0 ? (d.obs || []) : null }));
+    state.full = state.runs[0];
     if (d.antennaHeight) $("#povH").value = d.antennaHeight;
     if (d.hpbw) $("#povHpbw").value = d.hpbw;
     applyStep();
     applyBuildings(d.buildings && d.buildings.length
       ? { buildings: d.buildings, meta: d.buildingsMeta || {} } : null);
-    setStatus(`${d.label}(埋め込みデータ / ${d.times.length} サンプル`
+    const total = runs.reduce((a, r) => a + r.times.length, 0);
+    setStatus(`${runs.map(r => r.label).join(" vs ")}(埋め込みデータ / `
+      + `${runs.length > 1 ? runs.length + "ソース / " : ""}${total} サンプル`
       + `${d.buildings && d.buildings.length ? " / 建物 " + d.buildings.length + " 棟" : ""})`
       + " — 粒度と再生速度は自由に変えられます");
     return true;
