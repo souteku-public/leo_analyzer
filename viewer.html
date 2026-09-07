@@ -114,8 +114,10 @@ dialog::backdrop{background:rgba(0,0,0,.45)}
     </div>
     <div class="legend" id="legendCmp" style="display:none">
       <span id="cmpLegend"></span>
-      <span class="muted">実線=下り / 破線=上り。縦線=再生位置。
+      <span class="muted">実線=上り / 破線=下り。縦線=再生位置。
         横の破線=その回線の平均</span>
+      <label class="muted"><input type="checkbox" id="cmpDown" checked>
+        下りも表示(外すと上りだけを縦いっぱいに描きます)</label>
     </div>
     <div class="legend"><span id="statsInfo" class="muted"></span></div>
     <div class="legend" id="hoLegend" style="display:none">
@@ -313,9 +315,11 @@ const state = {
   runs: [],                                       // 比較用に読み込んだソース
 };
 // 比較はスループットだけを見るので、指標が2つ(下り/上り)しかない。
-// そのぶん色をアンテナの識別に使い、下り/上りは線種で分ける
+// そのぶん色をアンテナの識別に使い、下り/上りは線種で分ける。
+// 中継用途で見たいのは上りなので、上りを実線・下りを破線にし、
+// 描画順も下り→上りにして上りが手前に来るようにしている
 const SRC_COLORS = ["--s1", "--s2", "--s3", "--s4"];
-const CMP_CHANS = [["down_mbps", []], ["up_mbps", [6, 4]]];
+const CMP_CHANS = [["down_mbps", [6, 4]], ["up_mbps", []]];
 const SRC_DASH = [[], [6, 4], [2, 3], [10, 4]];
 
 // StarlinkはUTCの15秒グリッド(:00/:15/:30/:45)でスケジューリングしており、
@@ -1556,9 +1560,13 @@ function drawStrip() {
   const srcs = state.run.cmp || [{ series: state.run.series,
                                    stats: state.run.stats || {} }];
   const multi = srcs.length > 1;
-  // 比較モードは下り/上りだけを見る。色はアンテナ、線種が下り/上り
-  const plan = multi ? CMP_CHANS.map(([key, dash]) => ({ key, dash }))
-                     : chans.map(([key, col]) => ({ key, col, dash: [] }));
+  // 比較モードは下り/上りだけを見る。色はアンテナ、線種が下り/上り。
+  // 下りを外すと、残った上りが縦いっぱいに広がる(共通スケールのため)
+  const withDown = !multi || $("#cmpDown").checked;
+  const plan = multi
+    ? CMP_CHANS.filter(([key]) => withDown || key !== "down_mbps")
+               .map(([key, dash]) => ({ key, dash }))
+    : chans.map(([key, col]) => ({ key, col, dash: [] }));
   // 比較モードは下りも上りも Mbps なので、4本すべてを共通スケールに載せる。
   // 指標ごとに正規化すると、22Mbpsの上りが180Mbpsの下りより上に来てしまう
   let shared = null;
@@ -1651,6 +1659,7 @@ function drawHandoverMarks(g, pad, plot, n, xOf) {
 }
 
 $("#hoShow").onchange = () => render();
+$("#cmpDown").onchange = () => render();
 
 $("#strip").onclick = e => {
   if (!state.run) return;
