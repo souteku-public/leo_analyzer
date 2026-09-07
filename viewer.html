@@ -119,6 +119,18 @@ dialog::backdrop{background:rgba(0,0,0,.45)}
       <label class="muted"><input type="checkbox" id="cmpDown" checked>
         下りも表示(外すと上りだけを縦いっぱいに描きます)</label>
     </div>
+    <!-- 2台のPCで同時に測ると内部時計がずれる。基準(GPSで時刻が入る
+         Kymeta)に他方を寄せる -->
+    <div class="legend" id="syncBar" style="display:none">
+      <label class="muted">基準の時計 <select id="syncRef"></select></label>
+      <button id="syncBtn" class="primary"
+        title="基準の測定に時刻を合わせます。走行軌跡があれば軌跡から、
+なければ先頭のデータどうしを合わせます">時刻を合わせる</button>
+      <label class="muted">ずれ <input id="syncOff" type="number" step="1"
+        style="width:6.5em"> 秒</label>
+      <button id="syncReset">解除</button>
+      <span id="syncNote" class="muted"></span>
+    </div>
     <div class="legend"><span id="statsInfo" class="muted"></span></div>
     <div class="legend" id="hoLegend" style="display:none">
       <label class="muted"><input type="checkbox" id="hoShow" checked>
@@ -367,10 +379,12 @@ function applyRun(run) {
   const multi = cmp.length > 1;
   $("#legendSingle").style.display = multi ? "none" : "";
   $("#legendCmp").style.display = multi ? "" : "none";
+  $("#syncBar").style.display = multi ? "" : "none";
   if (multi) {
     $("#cmpLegend").innerHTML = cmp.map((c, i) =>
       `<span style="margin-right:14px"><span class="sw" style="background:var(${
         SRC_COLORS[i % SRC_COLORS.length]})"></span>${c.label}</span>`).join("");
+    updateSyncUI();
   }
   const ho = state.handover = run.handover || null;
   $("#hoLegend").style.display = ho ? "" : "none";
@@ -607,7 +621,7 @@ async function loadFiles(all, append) {
   const entry = {
     label,
     sources: used.map(f => ({ file: f })), times, series, handover, stats,
-    obsLocal, bldLocal,
+    obsLocal, bldLocal, shift: 0,
   };
   if (append && state.runs.length) state.runs.push(entry);
   else { state.runs = [entry]; state.lastFiles = all; }
@@ -628,7 +642,9 @@ function applyStep() {
   const full = state.full = runs[0];
   const step = +$("#step").value;
   const all = new Set();
-  runs.forEach(r => r.times.forEach(t => all.add(t)));
+  // shift は時計合わせのぶん(秒)。ここで足してから和集合を取るので、
+  // グラフ・地図・アンテナ視点・平均値がすべて同じ補正で動く
+  runs.forEach(r => r.times.forEach(t => all.add(t + (r.shift || 0))));
   let times = [...all].sort((a, b) => a - b);
   if (step > 1) {
     const kept = []; let next = times[0];
@@ -638,14 +654,15 @@ function applyStep() {
   // ソースごとに同じ時間軸へ載せ直す。ここで分けて持つので、
   // 同名の列(mbps_down など)が上書きし合うことはない
   const align = r => {
-    const idx = new Map(r.times.map((t, i) => [t, i]));
+    const sh = r.shift || 0;
+    const idx = new Map(r.times.map((t, i) => [t + sh, i]));
     const out = {};
     for (const [k, arr] of Object.entries(r.series))
       out[k] = times.map(t => { const i = idx.get(t); return i == null ? null : arr[i]; });
     return out;
   };
   const cmp = runs.map((r, i) => ({ label: r.label, i, series: align(r),
-                                    stats: r.stats, handover: r.handover }));
+                                    stats: r.stats, handover: handoverOf(r) }));
   const series = cmp[0].series;
   const pos = times.map((t, i) => [series.lat[i], series.lon[i]])
                    .filter(p => p[0] != null && p[1] != null);
@@ -664,9 +681,158 @@ function applyStep() {
              meta: full.meta || {}, sources: full.sources || [],
              times, series, home, step, cmp,
              obsLocal: runs.map(r => r.obsLocal).find(Boolean),
-             handover: full.handover, stats: full.stats,
+             handover: handoverOf(full), stats: full.stats,
              bldLocal: runs.map(r => r.bldLocal).find(Boolean) });
 }
+
+// 15秒境界の判定は絶対時刻に依存する。時計をずらした測定は、
+// ずらした後の時刻で取り直さないと境界との関係が変わってしまう
+function handoverOf(r) {
+  const sh = r.shift || 0;
+  if (!sh) return r.handover;
+  const loss = [], span = [];
+  const L = r.series.loss || [], R = r.series.rtt_ms || [];
+  r.times.forEach((t, i) => {
+    if (L[i] > 0) loss.push(t + sh);
+    if (L[i] != null || R[i] != null) span.push(t + sh);
+  });
+  return handoverStats(loss, span);
+}
+
+// ---- 2台のPCの時計合わせ ----
+// 同時に測っても、PCの内部時計がずれていると重ねた波形が一致しない。
+// Kymetaの時刻はGPSで入るので、基準にするならこちらが妥当。
+const SYNC_COARSE_S = 5, SYNC_RANGE_S = 1800, SYNC_SAMPLES = 800;
+
+function looksKymeta(r) {
+  if ((r.series.kymeta_az || []).some(v => v != null)) return true;
+  const names = (r.sources || []).map(s => s.file).join(" ") + " " + (r.label || "");
+  return /kymeta|oneweb/i.test(names);
+}
+// 既定の基準は Kymeta。無ければ1つ目
+function defaultRef() {
+  const i = state.runs.findIndex(looksKymeta);
+  return i < 0 ? 0 : i;
+}
+function syncRefIndex() {
+  const v = +$("#syncRef").value;
+  return Number.isInteger(v) && state.runs[v] ? v : defaultRef();
+}
+// 実測の緯度経度だけを、補正後の時刻で取り出す
+function gpsTrack(r) {
+  const sh = r.shift || 0, out = [];
+  const la = r.series.lat || [], lo = r.series.lon || [];
+  r.times.forEach((t, i) => {
+    if (la[i] != null && lo[i] != null) out.push([t + sh, la[i], lo[i]]);
+  });
+  return out;
+}
+function spanMetres(track) {
+  if (track.length < 2) return 0;
+  const las = track.map(p => p[1]), los = track.map(p => p[2]);
+  const mid = (Math.max(...las) + Math.min(...las)) / 2;
+  return Math.hypot((Math.max(...las) - Math.min(...las)) * 111320,
+                    (Math.max(...los) - Math.min(...los)) * 111320
+                    * Math.cos(mid * Math.PI / 180));
+}
+// GPSの時刻はPCの時計と無関係なので、同じ車両なら「軌跡が最もよく重なる
+// ずらし量」が時計のずれそのものになる。粗く探してから1秒刻みで詰める
+function matchByTrack(refTrack, otherTrack) {
+  const ref = new Map(refTrack.map(p => [p[0], p]));
+  const step = Math.max(1, Math.ceil(otherTrack.length / SYNC_SAMPLES));
+  const probe = otherTrack.filter((_, i) => i % step === 0);
+  const cosLat = Math.cos(refTrack[0][1] * Math.PI / 180);
+  const cost = lag => {
+    let sum = 0, n = 0;
+    for (const [t, la, lo] of probe) {
+      const p = ref.get(t + lag); if (!p) continue;
+      sum += Math.hypot((p[1] - la) * 111320, (p[2] - lo) * 111320 * cosLat);
+      n++;
+    }
+    return n >= 20 ? { d: sum / n, n } : null;
+  };
+  const scored = [];
+  for (let lag = -SYNC_RANGE_S; lag <= SYNC_RANGE_S; lag += SYNC_COARSE_S) {
+    const c = cost(lag); if (c) scored.push({ lag, ...c });
+  }
+  if (!scored.length) return null;
+  scored.sort((a, b) => a.d - b.d);
+  let best = scored[0];
+  for (let lag = best.lag - SYNC_COARSE_S; lag <= best.lag + SYNC_COARSE_S; lag++) {
+    const c = cost(lag); if (c && c.d < best.d) best = { lag, ...c };
+  }
+  // 「たまたま一番マシ」を正解と言わないための足切り。走行中なら、
+  // 正しいずらし量での残差は他より桁違いに小さくなる
+  const median = scored[Math.floor(scored.length / 2)].d;
+  return { ...best, median, confident: scored.length > 6 && best.d < median * 0.5 };
+}
+
+// ずらし量を決める。走行軌跡が使えるならそれで、駄目なら先頭合わせ
+function estimateShift(ref, other) {
+  const rt = gpsTrack(ref), ot = gpsTrack(other);
+  if (rt.length > 30 && ot.length > 30
+      && spanMetres(rt) > 50 && spanMetres(ot) > 50) {
+    const m = matchByTrack(rt, ot);
+    if (m && m.confident)
+      return { shift: (other.shift || 0) + m.lag, how: "track",
+               note: `走行軌跡が一致(ずれ ${m.d.toFixed(0)} m / ${m.n} 点で照合)` };
+  }
+  // 軌跡で照合できない(停車中・位置が無い・一致が弱い)ときは、
+  // 指示どおり先頭のデータどうしを合わせる
+  const delta = (ref.times[0] + (ref.shift || 0)) - other.times[0];
+  return { shift: delta, how: "head",
+    note: "先頭のデータどうしを合わせました(走行中のGPSがあれば軌跡で自動照合します)" };
+}
+
+function fmtShift(s) { return (s > 0 ? "+" : "") + s + "秒"; }
+
+function updateSyncUI() {
+  const sel = $("#syncRef");
+  const ref = sel.options.length === state.runs.length && sel.value !== ""
+    ? syncRefIndex() : defaultRef();
+  sel.innerHTML = state.runs.map((r, i) =>
+    `<option value="${i}"${i === ref ? " selected" : ""}>${r.label}</option>`).join("");
+  const others = state.runs.filter((_, i) => i !== ref);
+  $("#syncOff").value = others.length ? (others[0].shift || 0) : 0;
+  $("#syncOff").disabled = others.length !== 1;
+  const shifted = state.runs.filter((r, i) => i !== ref && r.shift);
+  $("#syncNote").textContent = shifted.length
+    ? shifted.map(r => `${r.label}: ${fmtShift(r.shift)}`).join(" / ")
+      + (state.syncNote ? " — " + state.syncNote : "")
+    : "ずれていなければ触らなくて構いません";
+}
+
+function syncNow() {
+  const ri = syncRefIndex(), ref = state.runs[ri];
+  if (state.runs.length < 2) return;
+  const results = [];
+  state.runs.forEach((r, i) => {
+    if (i === ri) return;
+    const e = estimateShift(ref, r);
+    r.shift = e.shift;
+    results.push(`${r.label} を ${fmtShift(e.shift)}`);
+    state.syncNote = e.note;
+  });
+  applyStep();
+  setStatus(`${ref.label} の時計に合わせました: ${results.join(" / ")} — `
+    + state.syncNote + "。数値欄で1秒ずつ微調整できます");
+}
+$("#syncBtn").onclick = () => syncNow();
+$("#syncRef").onchange = () => updateSyncUI();
+$("#syncOff").onchange = () => {
+  const ri = syncRefIndex();
+  const other = state.runs.findIndex((_, i) => i !== ri);
+  if (other < 0) return;
+  state.runs[other].shift = Math.round(+$("#syncOff").value || 0);
+  state.syncNote = "手動で指定";
+  applyStep();
+};
+$("#syncReset").onclick = () => {
+  state.runs.forEach(r => r.shift = 0);
+  state.syncNote = "";
+  applyStep();
+  setStatus("時計合わせを解除しました(記録された時刻のまま重ねます)");
+};
 
 // 走行範囲がちょうど収まるズーム(静止なら市街地スケール)
 function autoZoom(run) {
@@ -2315,7 +2481,8 @@ async function exportHTML() {
     // 比較モードのソースをすべて埋め込む(v1は単一ソースだった)
     runs: runs.map(r => ({ label: r.label, sources: r.sources || [],
       meta: r.meta || {}, times: r.times, series: r.series,
-      handover: r.handover || null, stats: r.stats || null })),
+      handover: r.handover || null, stats: r.stats || null,
+      shift: r.shift || 0 })),   // 時計合わせも一緒に持って出る
     buildings: state.bld.list, buildingsMeta: state.bld.meta,
     obs: state.obs.list.length
       ? state.obs.list.map((e, i) => state.obs.grids.get(i)).filter(Boolean)
@@ -2359,7 +2526,8 @@ async function loadEmbedded() {
     const runs = d.runs || [d];          // v1(単一ソース)も読めるようにしておく
     state.runs = runs.map((r, i) => ({ label: r.label, sources: r.sources,
       meta: r.meta, times: r.times, series: r.series, handover: r.handover,
-      stats: r.stats, obsLocal: i === 0 ? (d.obs || []) : null }));
+      stats: r.stats, shift: r.shift || 0,
+      obsLocal: i === 0 ? (d.obs || []) : null }));
     state.full = state.runs[0];
     if (d.antennaHeight) $("#povH").value = d.antennaHeight;
     if (d.hpbw) $("#povHpbw").value = d.hpbw;
