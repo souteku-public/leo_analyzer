@@ -65,13 +65,14 @@ dialog::backdrop{background:rgba(0,0,0,.45)}
 <header>
   <h1>LEO データビューア</h1>
   <button id="pick" class="primary">データを選択…</button>
-  <input id="fileInput" type="file" multiple accept=".csv,.gz,.jsonl,.json" hidden>
+  <input id="fileInput" type="file" multiple accept=".csv,.gz,.jsonl,.json,.html" hidden>
   <input id="dirInput" type="file" webkitdirectory directory hidden>
   <button id="addSrc" title="別の測定を重ねて比較します(StarlinkとKymetaなど)">比較用に追加…</button>
   <input id="addInput" type="file" webkitdirectory directory hidden>
   <button id="bldPick" title="PLATEAUのCityGML(.gml)か、変換済みのbuildings.json">建物(PLATEAU)…</button>
   <input id="bldInput" type="file" multiple accept=".gml,.json" hidden>
   <button id="exportHtml" title="測定データと建物を埋め込んだHTMLを保存。次回はそれを開くだけで同じ画面が出ます">HTMLで書き出す</button>
+  <button id="openHtml" title="以前このビューアで書き出したHTMLを、いまのビューアで開き直します(CSVやCityGMLの読み込みは不要)。画面にドラッグ＆ドロップしても同じです">書き出し済みHTMLを開く…</button>
   <span id="srcName" class="muted">未選択</span>
   <span style="flex:1"></span>
   <label class="muted">粒度
@@ -551,6 +552,12 @@ async function parseObstruction(file) {
 }
 
 async function loadFiles(all, append) {
+  // 以前書き出したHTMLをそのまま選べる。中身を取り出して読み込む
+  const exported = Array.from(all).find(f => /\.html?$/i.test(f.name));
+  if (exported && !Array.from(all).some(f => /\.csv(\.gz)?$/i.test(f.name))) {
+    await loadExportedHTML(exported);
+    return;
+  }
   const obsFiles = Array.from(all).filter(f => /obstruction.*\.jsonl(\.gz)?$/i.test(f.name));
   const bldFile = Array.from(all).find(f => /^buildings\.json$/i.test(f.name));
   const files = Array.from(all).filter(f => /\.csv(\.gz)?$/i.test(f.name));
@@ -899,6 +906,15 @@ $("#pick").onclick = () => {
 };
 $("#dirInput").onchange = e => loadFiles([...e.target.files]);
 $("#fileInput").onchange = e => loadFiles([...e.target.files]);
+$("#openHtml").onclick = () => $("#fileInput").click();
+// 書き出したHTMLはドラッグ＆ドロップでも開ける
+document.addEventListener("dragover", e => { e.preventDefault(); });
+document.addEventListener("drop", e => {
+  const files = [...(e.dataTransfer || {}).files || []];
+  if (!files.length) return;
+  e.preventDefault();
+  loadFiles(files);
+});
 $("#closeBrowser").onclick = closeDlg;
 $("#goPath").onclick = () => browse($("#pathInput").value);
 $("#useThis").onclick = () => { const p = $("#pathInput").value; closeDlg(); loadRun(p); };
@@ -2625,9 +2641,34 @@ $("#exportHtml").onclick = () => exportHTML();
 async function loadEmbedded() {
   const tag = document.getElementById(DATA_TAG);
   if (!tag) return false;
+  const text = tag.type === "application/json"
+    ? tag.textContent : await ungzipB64(tag.textContent.trim()).catch(() => null);
+  return text ? applyEmbedded(text) : false;
+}
+
+// 以前に書き出したHTMLを、この(新しい)ビューアで開き直す。
+// 書き出したHTMLはその時点のビューア本体ごと保存されるので、
+// 直した機能を効かせるには新しいビューアに読ませ直す必要がある。
+// CSVやCityGMLを揃え直さずに済むよう、埋め込み部分だけを取り出す
+async function loadExportedHTML(file) {
+  const html = await readTextFile(file);
+  const m = html.match(
+    /<script[^>]*id="leo-embedded-data"[^>]*type="([^"]+)"[^>]*>([\s\S]*?)<\/script>/);
+  if (!m) {
+    setStatus(`${file.name} にはこのビューアのデータが入っていません`
+      + "(「HTMLで書き出す」で作ったファイルを選んでください)");
+    return false;
+  }
+  const text = m[1] === "application/json"
+    ? m[2] : await ungzipB64(m[2].trim());
+  const ok = await applyEmbedded(text, file.name);
+  if (ok) setStatus($("#status").textContent
+    + " — 書き出し直すと、いまのビューアの修正が入ったHTMLになります");
+  return ok;
+}
+
+async function applyEmbedded(text, from) {
   try {
-    const text = tag.type === "application/json"
-      ? tag.textContent : await ungzipB64(tag.textContent.trim());
     const d = JSON.parse(text);
     // 障害物マップは obsLocal として渡す。applyRun が state.obs を組み立て
     // 直すので、ここで直接代入すると上書きされてしまう
@@ -2648,7 +2689,8 @@ async function loadEmbedded() {
     applyBuildings(d.buildings && d.buildings.length
       ? { buildings: d.buildings, meta: d.buildingsMeta || {} } : null, true);
     const total = runs.reduce((a, r) => a + r.times.length, 0);
-    setStatus(`${runs.map(r => r.label).join(" vs ")}(埋め込みデータ / `
+    setStatus(`${from ? from + " から読み込みました: " : ""}`
+      + `${runs.map(r => r.label).join(" vs ")}(埋め込みデータ / `
       + `${runs.length > 1 ? runs.length + "ソース / " : ""}${total} サンプル`
       + `${d.buildings && d.buildings.length ? " / 建物 " + d.buildings.length + " 棟" : ""})`
       + " — 粒度と再生速度は自由に変えられます");
