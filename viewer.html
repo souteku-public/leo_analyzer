@@ -319,6 +319,9 @@ const state = {
   run: null, idx: 0, playing: false, timer: null,
   home: null, homeManual: null, zoom: 8, sats: {}, rain: null,
   satAt: null, rainAt: null, pickMode: false,
+  // 取得済みの雨(1時間ごとの格子)。HTMLに埋め込むので、書き出した
+  // ファイルは通信できない場所でも同じ雨が出る
+  rainFrames: new Map(), rainLabel: null,
   // 障害物マップ(Starlink)と、15秒ハンドオーバー境界の集計
   obs: { list: [], grids: new Map(), shown: -1, path: null, pending: false },
   handover: null,
@@ -420,7 +423,8 @@ function applyRun(run) {
   } else {
     // 粒度を変えるたびに再読込が走るので、手で読み込んだ建物は捨てない
     applyBuildings(state.bld.list.length
-      ? { buildings: state.bld.list, meta: state.bld.meta } : null);
+      ? { buildings: state.bld.list, meta: state.bld.meta } : null,
+      state.bld.manual);
   }
   if (SERVER_MODE && run.path) loadObstructionIndex(run.path);
   const src = run.sources.map(s => s.file).join(", ");
@@ -663,7 +667,7 @@ function applyStep() {
   };
   const cmp = runs.map((r, i) => ({ label: r.label, i, series: align(r),
                                     stats: r.stats, handover: handoverOf(r) }));
-  const series = cmp[0].series;
+  const series = mergedSeries(cmp);
   const pos = times.map((t, i) => [series.lat[i], series.lon[i]])
                    .filter(p => p[0] != null && p[1] != null);
   let home = null;
@@ -683,6 +687,31 @@ function applyStep() {
              obsLocal: runs.map(r => r.obsLocal).find(Boolean),
              handover: handoverOf(full), stats: full.stats,
              bldLocal: runs.map(r => r.bldLocal).find(Boolean) });
+}
+
+// 比較モードの run.series は「1つ目のソース」ではなく、チャンネルごとに
+// データを持っているソースから取る。Starlinkを先に読み込んだだけで
+// 位置・指向が無いことにされ、地図も降水もアンテナ視点も出なくなるため。
+// 位置と指向は同じアンテナのものを使わないと意味がないので、
+// 組を崩さずソース単位で選ぶ
+function mergedSeries(cmp) {
+  const out = Object.assign({}, cmp[0].series);
+  const has = (c, k) => (c.series[k] || []).some(v => v != null);
+  const posSrc = cmp.find(c => has(c, "lat") && has(c, "lon"));
+  if (posSrc) ["lat", "lon", "speed"].forEach(k => {
+    if (posSrc.series[k]) out[k] = posSrc.series[k];
+  });
+  const lookSrc = cmp.find(c => has(c, "kymeta_az") && has(c, "kymeta_el"));
+  if (lookSrc) ["kymeta_az", "kymeta_el"].forEach(k => out[k] = lookSrc.series[k]);
+  // アンテナ視点は指向を持つソースの位置で描く(指向と位置がずれると嘘になる)
+  if (lookSrc && has(lookSrc, "lat") && has(lookSrc, "lon"))
+    ["lat", "lon"].forEach(k => out[k] = lookSrc.series[k]);
+  ["starlink_az", "starlink_el", "clearance_deg", "rain_mm", "snr_db"]
+    .forEach(k => {
+      const src = cmp.find(c => has(c, k));
+      if (src) out[k] = src.series[k];
+    });
+  return out;
 }
 
 // 15秒境界の判定は絶対時刻に依存する。時計をずらした測定は、
@@ -1377,7 +1406,7 @@ async function loadCityGML(files) {
   if (json.length) {          // 変換済みならそのまま
     try {
       const payload = JSON.parse(await json[0].text());
-      applyBuildings(payload);
+      applyBuildings(payload, true);
       setStatus(`建物データを読み込みました: ${payload.count || (payload.buildings || []).length} 棟`);
     } catch (e) { setStatus("buildings.json を読めませんでした: " + e.message); }
     return;
@@ -1415,7 +1444,7 @@ async function loadCityGML(files) {
   }
   applyBuildings({ buildings: out, count: out.length,
     meta: { source: gml.map(f => f.name).join(", "),
-            antenna_height_m: +$("#povH").value || 2.6, bbox } });
+            antenna_height_m: +$("#povH").value || 2.6, bbox } }, true);
   setStatus(`CityGML ${gml.length} ファイル中 ${use.length} ファイルを解析`
     + `(残りはメッシュ番号で読み飛ばし): ${scanned} 棟を走査し、`
     + `走行範囲の ${out.length} 棟を採用しました`
@@ -1507,16 +1536,23 @@ $("#saveClear").onclick = () => {
 };
 
 async function loadBuildings(path) {
+  // 手で読み込んだ建物を、測定フォルダ側に buildings.json が無いという
+  // だけで消さない。サーバ版では粒度を変えるたびにここを通るので、
+  // .gml を読み込んだ直後に粒度を変えると建物が消えていた
+  if (state.bld.manual && state.bld.list.length) return;
   try {
     const j = await api("/api/buildings", { path });
-    applyBuildings(j);
-  } catch (e) { applyBuildings({ buildings: [], meta: {} }); }
+    if ((j.buildings || []).length || !state.bld.list.length) applyBuildings(j);
+  } catch (e) {
+    if (state.bld.list.length) applyBuildings({ buildings: [], meta: {} });
+  }
 }
 
-function applyBuildings(payload) {
+function applyBuildings(payload, manual) {
   const list = (payload && payload.buildings) || [];
   state.bld = { list, meta: (payload && payload.meta) || {},
-                prepared: list.length ? prepareBuildings(list) : null };
+                prepared: list.length ? prepareBuildings(list) : null,
+                manual: !!manual || (!!state.bld && state.bld.manual && !payload) };
   const on = list.length && state.run &&
     (state.run.series.kymeta_az || []).some(v => v != null);
   $("#povCard").style.display = on ? "" : "none";
@@ -2302,9 +2338,54 @@ function jmaTile(base, z, x, y) {
   return _rainTiles[key];
 }
 const _rainTiles = {};
-// 単体モード: Open-Meteo を直接(CORS許可あり)。7x7グリッドを一括取得
+// Open-Meteo には過去のとり方が3通りある。どれが使えるかは日付しだいで、
+// しかも境界がはっきりしない(予報APIは古い日付でも 200 を返し、値だけが
+// null になる)。そこで「エラーにならず、実際に値が入っていたもの」を
+// 採用する方式にしている
+const OM_ENDPOINTS = [
+  { url: "https://api.open-meteo.com/v1/forecast",
+    label: "Open-Meteo 実況/予報" },
+  // 高解像度モデル(日本はJMA MSM 5km)の保存版。2021年以降ずっと残る
+  { url: "https://historical-forecast-api.open-meteo.com/v1/forecast",
+    label: "Open-Meteo 過去モデル(高解像度)" },
+  // 最後の砦。25km格子と粗いが1940年から途切れない
+  { url: "https://archive-api.open-meteo.com/v1/archive",
+    label: "Open-Meteo ERA5(25km)" },
+];
+async function omGet(url, q) {
+  const r = await fetch(url + "?" + q);
+  let j;
+  try { j = await r.json(); }
+  catch (e) { throw new Error(`HTTP ${r.status}`); }
+  const head = Array.isArray(j) ? j[0] : j;
+  // 使用量超過などはこの形で返る。握りつぶすと「なぜか雨が出ない」になる
+  if (head && (head.error || head.reason)) throw new Error(head.reason || "APIエラー");
+  return Array.isArray(j) ? j : [j];
+}
+// 期間を日付で指定して取る。past_days で丸ごと取ると、地図の1コマ
+// (169地点)だけで44日ぶん=4MB になり、無料枠を数コマで使い切る
+async function omHourly(q, ageDays) {
+  const order = ageDays <= 5 ? [0, 1, 2] : [1, 0, 2];
+  let last = null;
+  for (const i of order) {
+    try {
+      const arr = await omGet(OM_ENDPOINTS[i].url, q);
+      if (arr.some(e => ((e.hourly || {}).precipitation || []).some(v => v != null)))
+        return { arr, label: OM_ENDPOINTS[i].label };
+      last = new Error("この期間の値が入っていませんでした");
+    } catch (e) { last = e; }
+  }
+  throw last || new Error("取得できませんでした");
+}
+const dayOf = ms => new Date(ms).toISOString().slice(0, 10);
+
+// 単体モード: Open-Meteo を直接(CORS許可あり)。13x13グリッドを一括取得
 async function rainDirect(lat, lon, epoch) {
-  const N = 13, SPAN = 0.36, half = SPAN / 2;   // 約40km四方を3.3km間隔
+  // 場所も鍵に含める。同じ時刻でも測定地が違えば別の雨
+  const hourKey = `${Math.floor(epoch / 3600) * 3600}@${lat.toFixed(2)},${lon.toFixed(2)}`;
+  const cached = state.rainFrames.get(hourKey);
+  if (cached) return cached;                      // 書き出したHTMLはここで完結
+  const N = 13, SPAN = 0.36, half = SPAN / 2;     // 約40km四方を3.3km間隔
   const lonScale = 1 / Math.max(Math.cos(lat * Math.PI / 180), 0.2);
   const lats = [], lons = [];
   for (let i = 0; i < N; i++) {
@@ -2314,34 +2395,24 @@ async function rainDirect(lat, lon, epoch) {
   }
   const pLat = [], pLon = [];
   lats.forEach(la => lons.forEach(lo => { pLat.push(la); pLon.push(lo); }));
-  const when = new Date(epoch * 1000);
+  const when = new Date(Math.floor(epoch / 3600) * 3600 * 1000);
   const ageDays = Math.floor((Date.now() - when.getTime()) / 86400e3);
   const iso = when.toISOString().slice(0, 13) + ":00";
-  const base = ageDays <= 90
-    ? "https://api.open-meteo.com/v1/forecast"
-    : "https://archive-api.open-meteo.com/v1/archive";
   const q = new URLSearchParams({
     latitude: pLat.join(","), longitude: pLon.join(","),
     hourly: "precipitation", timezone: "UTC",
+    start_date: dayOf(when.getTime()), end_date: dayOf(when.getTime()),
   });
-  if (ageDays <= 90) {
-    q.set("past_days", String(Math.max(1, Math.min(92, ageDays + 1))));
-    q.set("forecast_days", "1");
-  } else {
-    const day = when.toISOString().slice(0, 10);
-    q.set("start_date", day);
-    q.set("end_date", new Date(when.getTime() + 86400e3).toISOString().slice(0, 10));
-  }
-  let payload = await (await fetch(base + "?" + q)).json();
-  if (!Array.isArray(payload)) payload = [payload];
-  const grid = payload.map(e => {
+  const { arr, label } = await omHourly(q, ageDays);
+  const grid = arr.map(e => {
     const h = (e.hourly && e.hourly.time) || [];
     const i = h.indexOf(iso);
     return i >= 0 ? e.hourly.precipitation[i] : null;
   });
-  return { lats, lons, grid, n: N, hour_utc: iso, unit: "mm/h",
-           source: ageDays <= 90 ? "Open-Meteo (実況/予報)" : "Open-Meteo (ERA5)",
-           available: grid.some(v => v != null) };
+  const frame = { lats, lons, grid, n: N, hour_utc: iso, unit: "mm/h",
+                  source: label, available: grid.some(v => v != null) };
+  if (frame.available) state.rainFrames.set(hourKey, frame);
+  return frame;
 }
 // 測定期間ぶんの降水量を1点で取り、時系列としてグラフに重ねる。
 // 地図の重ね描きは「その瞬間」しか見えないので、夕立と回線品質の
@@ -2354,21 +2425,21 @@ async function fetchRainSeries() {
   const t0 = full.times[0], t1 = full.times[full.times.length - 1];
   const ageDays = Math.floor((Date.now() - t0 * 1000) / 86400e3);
   const q = new URLSearchParams({ latitude: home.lat.toFixed(4),
-    longitude: home.lon.toFixed(4), hourly: "precipitation", timezone: "UTC" });
-  let base = "https://api.open-meteo.com/v1/forecast";
-  if (ageDays <= 90) {
-    q.set("past_days", String(Math.max(1, Math.min(92, ageDays + 2))));
-    q.set("forecast_days", "1");
-  } else {
-    base = "https://archive-api.open-meteo.com/v1/archive";
-    q.set("start_date", new Date(t0 * 1000).toISOString().slice(0, 10));
-    q.set("end_date", new Date((t1 + 86400) * 1000).toISOString().slice(0, 10));
-  }
-  let hourly;
+    longitude: home.lon.toFixed(4), hourly: "precipitation", timezone: "UTC",
+    start_date: dayOf(t0 * 1000), end_date: dayOf(t1 * 1000) });
+  let hourly, label;
   try {
-    hourly = (await (await fetch(base + "?" + q)).json()).hourly;
-  } catch (e) { return; }
-  if (!hourly || !hourly.time) return;
+    const got = await omHourly(q, ageDays);
+    hourly = got.arr[0].hourly; label = got.label;
+  } catch (e) {
+    // 失敗を黙って飲むと「雨だけ出ない」の原因が分からない。
+    // 次の描画で再試行できるよう、取得済みの印も消しておく
+    state.rainSeriesAt = null;
+    $("#rainInfo2").textContent = "降水(グラフ)を取得できません: " + e.message;
+    return;
+  }
+  if (!hourly || !hourly.time) { state.rainSeriesAt = null; return; }
+  state.rainLabel = label;
   const byHour = new Map();
   hourly.time.forEach((h, i) => byHour.set(h, hourly.precipitation[i]));
   const at = t => byHour.get(new Date(t * 1000).toISOString().slice(0, 13) + ":00");
@@ -2421,16 +2492,23 @@ async function maybeFetchRain(t) {
   }
   state.jma = null;
   const hour = Math.floor(t / 3600) * 3600;
+  const key = `${hour}@${home.lat.toFixed(2)},${home.lon.toFixed(2)}`;
   try {
-    const j = SERVER_MODE
+    // 埋め込み済みのコマがあれば通信しない。サーバ版で取ったコマも
+    // ここに貯めて、書き出しに載せる
+    const j = state.rainFrames.get(key) || (SERVER_MODE
       ? await api("/api/rain", { lat: home.lat, lon: home.lon, t: hour })
-      : await rainDirect(home.lat, home.lon, hour);
+      : await rainDirect(home.lat, home.lon, hour));
+    if (j && j.available) state.rainFrames.set(key, j);
     state.rain = j;
     $("#rainInfo").textContent = j.available
       ? `${j.hour_utc}Z の降水 / ${j.source}`
       : "この時刻の降水データは取得できませんでした";
     drawMap();
-  } catch (e) { $("#rainInfo").textContent = "降水: " + e.message; }
+  } catch (e) {
+    state.rainAt = null;            // 一度の失敗で以後ずっと空にしない
+    $("#rainInfo").textContent = "降水: " + e.message;
+  }
 }
 $("#rainSrc").onchange = () => { state.rainAt = null; render(); };
 
@@ -2470,9 +2548,35 @@ async function fullResolutionSources() {
   return [];
 }
 
+// 書き出したHTMLは通信なしで開かれる前提にする。降水は測定期間ぶんの
+// コマを先に取っておき、そのまま埋め込む(気象庁タイルは画像なので
+// 埋め込めない。古い測定ではどのみち保持期間外)
+const EXPORT_RAIN_FRAMES_MAX = 24;
+async function prefetchRain() {
+  if ($("#rainSrc").value === "off") return "";
+  const full = state.full, home = activeHome();
+  if (!full || !home) return "";
+  await fetchRainSeries();
+  const hours = [];
+  for (let t = Math.floor(full.times[0] / 3600) * 3600;
+       t <= full.times[full.times.length - 1] && hours.length < EXPORT_RAIN_FRAMES_MAX;
+       t += 3600) hours.push(t);
+  let got = 0, err = null;
+  for (const h of hours) {
+    try {
+      setStatus(`降水データを取得中… ${got + 1}/${hours.length}`);
+      const f = await rainDirect(home.lat, home.lon, h);
+      if (f.available) got++;
+    } catch (e) { err = e; break; }
+  }
+  return err ? ` / 降水は ${got} コマで中断(${err.message})`
+             : got ? ` / 降水 ${got} コマ` : "";
+}
+
 async function exportHTML() {
   if (!state.run) { setStatus("先に測定データを読み込んでください"); return; }
   setStatus("HTMLを書き出しています…");
+  const rainNote = await prefetchRain();
   const runs = await fullResolutionSources();
   if (!runs.length) { setStatus("書き出せるデータがありません"); return; }
   const full = runs[0];
@@ -2489,6 +2593,10 @@ async function exportHTML() {
       : (full.obsLocal || []),
     antennaHeight: +$("#povH").value || 2.6,
     hpbw: +$("#povHpbw").value || 2.6,
+    // 雨も一緒に持って出る。開き直したときに再取得しないので、
+    // 通信できない場所でも、APIの使用量を使い切っていても同じ絵が出る
+    rainFrames: [...state.rainFrames.entries()],
+    rainSrc: $("#rainSrc").value,
   };
   const json = JSON.stringify(payload);
   const packed = await gzipB64(json);
@@ -2509,8 +2617,8 @@ async function exportHTML() {
   const name = (runs.map(r => r.label).join("_vs_") || "leo")
     .replace(/[^\w.-]+/g, "_").slice(0, 80) + "_viewer.html";
   download(name, out, "text/html;charset=utf-8");
-  setStatus(`${name} を保存しました(${(out.length / 1e6).toFixed(1)} MB)。`
-    + "このファイルを開くだけで、同じ画面が読み込みなしで出ます");
+  setStatus(`${name} を保存しました(${(out.length / 1e6).toFixed(1)} MB`
+    + `${rainNote})。このファイルを開くだけで、同じ画面が読み込みなしで出ます`);
 }
 $("#exportHtml").onclick = () => exportHTML();
 
@@ -2531,9 +2639,14 @@ async function loadEmbedded() {
     state.full = state.runs[0];
     if (d.antennaHeight) $("#povH").value = d.antennaHeight;
     if (d.hpbw) $("#povHpbw").value = d.hpbw;
+    if (d.rainSrc) $("#rainSrc").value = d.rainSrc;
+    state.rainFrames = new Map(d.rainFrames || []);
+    // 降水系列を埋め込んである測定は、取りに行かない(外に出さない)
+    if ((state.runs[0].series.rain_mm || []).some(v => v != null))
+      state.rainSeriesAt = state.runs[0].times[0];
     applyStep();
     applyBuildings(d.buildings && d.buildings.length
-      ? { buildings: d.buildings, meta: d.buildingsMeta || {} } : null);
+      ? { buildings: d.buildings, meta: d.buildingsMeta || {} } : null, true);
     const total = runs.reduce((a, r) => a + r.times.length, 0);
     setStatus(`${runs.map(r => r.label).join(" vs ")}(埋め込みデータ / `
       + `${runs.length > 1 ? runs.length + "ソース / " : ""}${total} サンプル`

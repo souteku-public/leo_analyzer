@@ -1,8 +1,15 @@
 """Rain around the antenna at the time of the measurement.
 
-Uses Open-Meteo (no API key): the forecast endpoint with past_days for
-recent captures, the ERA5 archive for older ones. One request returns a
-whole grid of points, which the viewer draws as a rain overlay.
+Uses Open-Meteo (no API key). Which of its three archives answers for a
+given day is not something you can decide from the date alone: the
+forecast endpoint still returns 200 for older days and simply leaves the
+values null, roughly two months back. So the endpoints are tried in turn
+and the first reply that actually carries values wins.
+
+Requests are scoped to the single day being drawn. Asking with past_days
+instead pulls every hour since then for all 169 grid points - about 4 MB
+for one frame, and enough call weight to burn the free daily quota in a
+handful of frames, after which everything fails at once.
 """
 
 import json
@@ -10,10 +17,20 @@ import math
 import time
 import urllib.parse
 import urllib.request
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 
 FORECAST_URL = "https://api.open-meteo.com/v1/forecast"
+# Archived runs of the same high-resolution model (JMA MSM over Japan),
+# kept from 2021 on - this is what covers captures older than the
+# forecast endpoint's window.
+HISTORICAL_URL = "https://historical-forecast-api.open-meteo.com/v1/forecast"
+# Last resort: ERA5 reanalysis, 25 km, but continuous back to 1940.
 ARCHIVE_URL = "https://archive-api.open-meteo.com/v1/archive"
+ENDPOINTS = [
+    (FORECAST_URL, "Open-Meteo 実況/予報"),
+    (HISTORICAL_URL, "Open-Meteo 過去モデル(高解像度)"),
+    (ARCHIVE_URL, "Open-Meteo ERA5(25km)"),
+]
 # The model behind Open-Meteo over Japan (JMA MSM) is on a 0.05 deg grid,
 # about 5.5 km. Sampling 40 km across at 3.3 km keeps that detail; the old
 # 7x7 over 1 deg threw most of it away at 18 km spacing.
@@ -41,7 +58,34 @@ def _request(url: str, params: dict):
         f"{url}?{query}", headers={"User-Agent": "leo_analyzer/viewer"}
     )
     with urllib.request.urlopen(request, timeout=45) as response:
-        return json.loads(response.read().decode("utf-8"))
+        payload = json.loads(response.read().decode("utf-8"))
+    entries = payload if isinstance(payload, list) else [payload]
+    head = entries[0] if entries else {}
+    # Quota and parameter errors come back as a normal 200 with a reason
+    if isinstance(head, dict) and (head.get("error") or head.get("reason")):
+        raise RuntimeError(head.get("reason") or "APIエラー")
+    return entries
+
+
+def _hourly(params: dict, age_days: int):
+    """First endpoint that answers with actual values."""
+    order = [0, 1, 2] if age_days <= 5 else [1, 0, 2]
+    last = None
+    for i in order:
+        url, label = ENDPOINTS[i]
+        try:
+            entries = _request(url, params)
+        except Exception as e:
+            last = e
+            continue
+        if any(
+            v is not None
+            for e in entries
+            for v in e.get("hourly", {}).get("precipitation", [])
+        ):
+            return entries, label
+        last = RuntimeError("この期間の値が入っていませんでした")
+    raise last or RuntimeError("取得できませんでした")
 
 
 def rain_grid(lat: float, lon: float, epoch: float):
@@ -61,24 +105,14 @@ def rain_grid(lat: float, lon: float, epoch: float):
         "hourly": "precipitation",
         "timezone": "UTC",
     }
-    if age_days <= 90:
-        params["past_days"] = str(max(1, min(92, age_days + 1)))
-        params["forecast_days"] = "1"
-        url = FORECAST_URL
-        source = "Open-Meteo (実況/予報モデル)"
-    else:
-        day = when.strftime("%Y-%m-%d")
-        params["start_date"] = day
-        params["end_date"] = (when + timedelta(days=1)).strftime("%Y-%m-%d")
-        url = ARCHIVE_URL
-        source = "Open-Meteo (ERA5 再解析)"
+    day = when.strftime("%Y-%m-%d")
+    params["start_date"] = day
+    params["end_date"] = day
 
     try:
-        payload = _request(url, params)
+        payload, source = _hourly(params, age_days)
     except Exception as e:
         return {"error": f"降水データを取得できませんでした: {e}"}
-    if isinstance(payload, dict):
-        payload = [payload]
 
     stamp = when.strftime("%Y-%m-%dT%H:00")
     values, hours = [], None
