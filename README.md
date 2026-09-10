@@ -165,6 +165,7 @@ python -m leo_analyzer --label oneweb_intellian --duration 10m --direction down
 | `--keep-all-columns` | — | CSVを圧縮せず全項目を記録する |
 | `--gzip-csv` | — | CSVをgzip圧縮して保存(`.csv.gz`、約1/10) |
 | `--compare DIR...` | — | 複数の測定を同じ時刻軸で比較する `compare.html` を生成 |
+| `--rtt-check DIR...` | — | 取得済みデータでRTTのどの検証ができるかを判定して表示(読むだけ) |
 
 ### 長時間測定するPCの設定(Windows)
 
@@ -768,6 +769,50 @@ summary.json には最小・最大・平均などが分けて集計されます:
 程度なら正常です。平均が500msを超えるような場合は経路異常(遠回りの
 ゲートウェイ/PoP、VPN経由など)を疑ってください。`unreachable_s` が
 多い場合はハンドオーバー断や遮蔽の影響が大きいことを示します。
+
+### 取得済みデータでRTT差をどこまで検証できるか(`--rtt-check`)
+
+アンテナを返却したあとでも、記録済みのCSVだけで切り分けられることが
+あります。**どの検証が成立するかは、その測定にどの列が「値付きで」
+入っているか**で決まります。
+
+```bash
+python -m leo_analyzer --rtt-check results/20260726_kymeta results/20260726_starlink
+```
+
+測定フォルダを読んで(**書き換えは一切しません**)、次の判定を出します。
+
+| 検証 | 必要なもの | 判定の根拠 |
+|---|---|---|
+| ①無負荷 vs 負荷 | `throughput.csv` の `phase` に **idle** と download/upload の両方 | 経路の遅さとバッファブロートを分離できる。`--baseline 0` で測ると不可 |
+| ②RTTのfloor | `latency_ms` が **300秒以上** | 下位5%が経路の素の遅延。軌道高度で説明できるのは10〜20ms程度 |
+| ③仰角との相関 | `look-angle.elevation` とRTTが**同じ秒で300秒以上**、仰角の幅**10°以上** | Kymetaのみ(Starlinkは設置姿勢しか出さない) |
+| ④切断直後の再接続コスト | `latency_ms` の**欠測ブロックが5個以上** | プローブはHTTPS接続を使い回すため、断の直後だけTCP+TLS再確立を含む |
+| ⑤区間分解 | `pop_ping_latency_ms` とRTTが同じ秒で300秒以上 | Starlinkのみ。衛星区間と地上区間に割れる |
+| ⑥SINRとの相関 | SINR列とRTTが同じ秒で300秒以上 | 電波品質起因(再送)か固定の経路コストかを分ける |
+
+出力例(○×だけでなく、その場で分かる数値も一緒に出ます):
+
+```
+=== results/20260726_kymeta
+  ファイル: kymeta_status.csv(1500行) / throughput.csv(1500行) / summary.json
+  ①無負荷 vs 負荷               ○  download 594秒 中央値 560.2ms / idle 300秒 中央値 181.2ms / upload 591秒 中央値 560.5ms
+  ②RTTのfloor                   ○  有効 1485秒 / 最小 155.4ms / 下位5% 174.2ms / 中央値 557.6ms
+  ③仰角との相関                 ○  揃う秒 1485 / 仰角 44.0° の幅
+  ④切断直後の再接続コスト       ○  欠測ブロック 5個 / 直後の中央値 1687.3ms(全体の 3.0倍)
+  ⑤区間分解(衛星区間/地上区間)  ×  pop_ping_latency_ms がありません(Starlinkのみ)
+  ⑥SINRとの相関                 ○  揃う秒 1485
+  経路の手がかり: v1_internal_status./status/beam.id, v1_internal_status./status/network.gateway-id
+```
+
+最後の**「経路の手がかり」**は、ビーム/ゲートウェイ/衛星のIDらしき項目が
+CSVヘッダや `*_status_static.json` に残っていないかを探した結果です。
+**接続先IPや経路(traceroute)は記録していない**ので、「どこを通っていたか」
+はこれらのIDが残っていた場合にしか辿れません。
+
+複数フォルダを渡すと、最後に**同じ秒がどれだけ重なっているか**も出ます。
+重なりが少ない場合は2台のPCの時計がずれているので、ビューアの
+「時刻を合わせる」で補正してから比較してください。
 
 ## 7. アンテナ情報の記録について
 

@@ -216,6 +216,13 @@ def build_parser():
         "runs (e.g. Starlink vs Kymeta) on one time axis, then exit",
     )
     p.add_argument(
+        "--rtt-check",
+        nargs="+",
+        metavar="DIR",
+        help="report which of the RTT analyses each captured run can "
+        "support (which columns carry usable values), then exit",
+    )
+    p.add_argument(
         "--shrink-csv",
         metavar="FILE",
         help="rewrite an oversized telemetry CSV, moving huge cells "
@@ -532,6 +539,12 @@ async def run(args):
         print(f"comparison report written: {out}")
         return
 
+    if args.rtt_check:
+        from .rtt_check import check
+
+        check(args.rtt_check)
+        return
+
     if args.report:
         from .report import generate_report
 
@@ -696,10 +709,15 @@ def interactive_args():
 
 
 def main(argv=None):
-    ensure_deps()
     if argv is None and len(sys.argv) == 1 and sys.stdin.isatty():
         argv = interactive_args()
     args = build_parser().parse_args(argv)
+    # 読むだけの機能(ビューア・レポート・検査)は標準ライブラリで動くので、
+    # 測定用のライブラリが無いPCでも使えるようにしておく
+    offline = (args.viewer or args.report or args.compare or args.shrink_csv
+               or args.rtt_check)
+    if not offline:
+        ensure_deps()
     try:
         asyncio.run(run(args))
     except KeyboardInterrupt:
